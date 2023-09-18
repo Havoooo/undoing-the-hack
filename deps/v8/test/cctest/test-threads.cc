@@ -25,129 +25,23 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#include "v8.h"
+#include "src/v8.h"
+#include "test/cctest/cctest.h"
 
-#include "platform.h"
-#include "isolate.h"
-
-#include "cctest.h"
-
-
-TEST(Preemption) {
-  v8::Locker locker;
-  v8::V8::Initialize();
-  v8::HandleScope scope;
-  v8::Context::Scope context_scope(v8::Context::New());
-
-  v8::Locker::StartPreemption(100);
-
-  v8::Handle<v8::Script> script = v8::Script::Compile(
-      v8::String::New("var count = 0; var obj = new Object(); count++;\n"));
-
-  script->Run();
-
-  v8::Locker::StopPreemption();
-  v8::internal::OS::Sleep(500);  // Make sure the timer fires.
-
-  script->Run();
-}
+#include "src/base/platform/platform.h"
+#include "src/isolate.h"
 
 
-enum Turn {
-  FILL_CACHE,
-  CLEAN_CACHE,
-  SECOND_TIME_FILL_CACHE,
-  DONE
-};
-
-static Turn turn = FILL_CACHE;
-
-
-class ThreadA : public v8::internal::Thread {
+class ThreadIdValidationThread : public v8::base::Thread {
  public:
-  ThreadA() : Thread("ThreadA") { }
-  void Run() {
-    v8::Locker locker;
-    v8::HandleScope scope;
-    v8::Context::Scope context_scope(v8::Context::New());
-
-    CHECK_EQ(FILL_CACHE, turn);
-
-    // Fill String.search cache.
-    v8::Handle<v8::Script> script = v8::Script::Compile(
-        v8::String::New(
-          "for (var i = 0; i < 3; i++) {"
-          "  var result = \"a\".search(\"a\");"
-          "  if (result != 0) throw \"result: \" + result + \" @\" + i;"
-          "};"
-          "true"));
-    CHECK(script->Run()->IsTrue());
-
-    turn = CLEAN_CACHE;
-    do {
-      {
-        v8::Unlocker unlocker;
-        Thread::YieldCPU();
-      }
-    } while (turn != SECOND_TIME_FILL_CACHE);
-
-    // Rerun the script.
-    CHECK(script->Run()->IsTrue());
-
-    turn = DONE;
-  }
-};
-
-
-class ThreadB : public v8::internal::Thread {
- public:
-  ThreadB() : Thread("ThreadB") { }
-  void Run() {
-    do {
-      {
-        v8::Locker locker;
-        if (turn == CLEAN_CACHE) {
-          v8::HandleScope scope;
-          v8::Context::Scope context_scope(v8::Context::New());
-
-          // Clear the caches by forcing major GC.
-          HEAP->CollectAllGarbage(v8::internal::Heap::kNoGCFlags);
-          turn = SECOND_TIME_FILL_CACHE;
-          break;
-        }
-      }
-
-      Thread::YieldCPU();
-    } while (true);
-  }
-};
-
-
-TEST(JSFunctionResultCachesInTwoThreads) {
-  v8::V8::Initialize();
-
-  ThreadA threadA;
-  ThreadB threadB;
-
-  threadA.Start();
-  threadB.Start();
-
-  threadA.Join();
-  threadB.Join();
-
-  CHECK_EQ(DONE, turn);
-}
-
-class ThreadIdValidationThread : public v8::internal::Thread {
- public:
-  ThreadIdValidationThread(i::Thread* thread_to_start,
-                           i::List<i::ThreadId>* refs,
-                           unsigned int thread_no,
-                           i::Semaphore* semaphore)
-    : Thread("ThreadRefValidationThread"),
-      refs_(refs), thread_no_(thread_no), thread_to_start_(thread_to_start),
-      semaphore_(semaphore) {
-  }
+  ThreadIdValidationThread(v8::base::Thread* thread_to_start,
+                           i::List<i::ThreadId>* refs, unsigned int thread_no,
+                           v8::base::Semaphore* semaphore)
+      : Thread(Options("ThreadRefValidationThread")),
+        refs_(refs),
+        thread_no_(thread_no),
+        thread_to_start_(thread_to_start),
+        semaphore_(semaphore) {}
 
   void Run() {
     i::ThreadId thread_id = i::ThreadId::Current();
@@ -165,44 +59,29 @@ class ThreadIdValidationThread : public v8::internal::Thread {
  private:
   i::List<i::ThreadId>* refs_;
   int thread_no_;
-  i::Thread* thread_to_start_;
-  i::Semaphore* semaphore_;
+  v8::base::Thread* thread_to_start_;
+  v8::base::Semaphore* semaphore_;
 };
+
 
 TEST(ThreadIdValidation) {
   const int kNThreads = 100;
   i::List<ThreadIdValidationThread*> threads(kNThreads);
   i::List<i::ThreadId> refs(kNThreads);
-  i::Semaphore* semaphore = i::OS::CreateSemaphore(0);
+  v8::base::Semaphore semaphore(0);
   ThreadIdValidationThread* prev = NULL;
   for (int i = kNThreads - 1; i >= 0; i--) {
     ThreadIdValidationThread* newThread =
-        new ThreadIdValidationThread(prev, &refs, i, semaphore);
+        new ThreadIdValidationThread(prev, &refs, i, &semaphore);
     threads.Add(newThread);
     prev = newThread;
     refs.Add(i::ThreadId::Invalid());
   }
   prev->Start();
   for (int i = 0; i < kNThreads; i++) {
-    semaphore->Wait();
+    semaphore.Wait();
   }
   for (int i = 0; i < kNThreads; i++) {
     delete threads[i];
   }
-}
-
-
-class ThreadC : public v8::internal::Thread {
- public:
-  ThreadC() : Thread("ThreadC") { }
-  void Run() {
-    Join();
-  }
-};
-
-
-TEST(ThreadJoinSelf) {
-  ThreadC thread;
-  thread.Start();
-  thread.Join();
 }

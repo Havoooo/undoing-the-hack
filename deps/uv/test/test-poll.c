@@ -21,8 +21,9 @@
 
 #include <errno.h>
 
-#ifndef _WIN32
+#ifdef _WIN32
 # include <fcntl.h>
+#else
 # include <sys/socket.h>
 # include <unistd.h>
 #endif
@@ -50,7 +51,7 @@ typedef struct connection_context_s {
   size_t read, sent;
   int is_server_connection;
   int open_handles;
-  int got_fin, sent_fin;
+  int got_fin, sent_fin, got_disconnect;
   unsigned int events, delayed_events;
 } connection_context_t;
 
@@ -61,7 +62,7 @@ typedef struct server_context_s {
 } server_context_t;
 
 
-static void delay_timer_cb(uv_timer_t* timer, int status);
+static void delay_timer_cb(uv_timer_t* timer);
 
 
 static test_mode_t test_mode = DUPLEX;
@@ -71,8 +72,11 @@ static int closed_connections = 0;
 static int valid_writable_wakeups = 0;
 static int spurious_writable_wakeups = 0;
 
+#ifndef _AIX
+static int disconnects = 0;
+#endif /* !_AIX */
 
-static int got_eagain() {
+static int got_eagain(void) {
 #ifdef _WIN32
   return WSAGetLastError() == WSAEWOULDBLOCK;
 #else
@@ -86,23 +90,7 @@ static int got_eagain() {
 }
 
 
-static void set_nonblocking(uv_os_sock_t sock) {
-  int r;
-#ifdef _WIN32
-  unsigned long on = 1;
-  r = ioctlsocket(sock, FIONBIO, &on);
-  ASSERT(r == 0);
-#else
-  int flags = fcntl(sock, F_GETFL, 0);
-  ASSERT(flags >= 0);
-  r = fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-  ASSERT(r >= 0);
-#endif
-}
-
-
-static uv_os_sock_t create_nonblocking_bound_socket(
-    struct sockaddr_in bind_addr) {
+static uv_os_sock_t create_bound_socket (struct sockaddr_in bind_addr) {
   uv_os_sock_t sock;
   int r;
 
@@ -112,8 +100,6 @@ static uv_os_sock_t create_nonblocking_bound_socket(
 #else
   ASSERT(sock >= 0);
 #endif
-
-  set_nonblocking(sock);
 
 #ifndef _WIN32
   {
@@ -159,6 +145,7 @@ static connection_context_t* create_connection_context(
   context->delayed_events = 0;
   context->got_fin = 0;
   context->sent_fin = 0;
+  context->got_disconnect = 0;
 
   r = uv_poll_init_socket(uv_default_loop(), &context->poll_handle, sock);
   context->open_handles++;
@@ -205,7 +192,7 @@ static void destroy_connection_context(connection_context_t* context) {
 
 static void connection_poll_cb(uv_poll_t* handle, int status, int events) {
   connection_context_t* context = (connection_context_t*) handle->data;
-  int new_events;
+  unsigned int new_events;
   int r;
 
   ASSERT(status == 0);
@@ -391,8 +378,17 @@ static void connection_poll_cb(uv_poll_t* handle, int status, int events) {
       new_events &= ~UV_WRITABLE;
     }
   }
+#ifndef _AIX
+  if (events & UV_DISCONNECT) {
+    context->got_disconnect = 1;
+    ++disconnects;
+    new_events &= ~UV_DISCONNECT;
+  }
 
+  if (context->got_fin && context->sent_fin && context->got_disconnect) {
+#else /* _AIX */
   if (context->got_fin && context->sent_fin) {
+#endif /* !_AIx */
     /* Sent and received FIN. Close and destroy context. */
     close_socket(context->sock);
     destroy_connection_context(context);
@@ -406,19 +402,19 @@ static void connection_poll_cb(uv_poll_t* handle, int status, int events) {
 
   /* Assert that uv_is_active works correctly for poll handles. */
   if (context->events != 0) {
-    ASSERT(uv_is_active((uv_handle_t*) handle));
+    ASSERT(1 == uv_is_active((uv_handle_t*) handle));
   } else {
-    ASSERT(!uv_is_active((uv_handle_t*) handle));
+    ASSERT(0 == uv_is_active((uv_handle_t*) handle));
   }
 }
 
 
-static void delay_timer_cb(uv_timer_t* timer, int status) {
+static void delay_timer_cb(uv_timer_t* timer) {
   connection_context_t* context = (connection_context_t*) timer->data;
   int r;
 
   /* Timer should auto stop. */
-  ASSERT(!uv_is_active((uv_handle_t*) timer));
+  ASSERT(0 == uv_is_active((uv_handle_t*) timer));
 
   /* Add the requested events to the poll mask. */
   ASSERT(context->delayed_events != 0);
@@ -479,12 +475,10 @@ static void server_poll_cb(uv_poll_t* handle, int status, int events) {
   ASSERT(sock >= 0);
 #endif
 
-  set_nonblocking(sock);
-
   connection_context = create_connection_context(sock, 1);
-  connection_context->events = UV_READABLE | UV_WRITABLE;
+  connection_context->events = UV_READABLE | UV_WRITABLE | UV_DISCONNECT;
   r = uv_poll_start(&connection_context->poll_handle,
-                    UV_READABLE | UV_WRITABLE,
+                    UV_READABLE | UV_WRITABLE | UV_DISCONNECT,
                     connection_poll_cb);
   ASSERT(r == 0);
 
@@ -495,12 +489,14 @@ static void server_poll_cb(uv_poll_t* handle, int status, int events) {
 }
 
 
-static void start_server() {
-  uv_os_sock_t sock;
+static void start_server(void) {
   server_context_t* context;
+  struct sockaddr_in addr;
+  uv_os_sock_t sock;
   int r;
 
-  sock = create_nonblocking_bound_socket(uv_ip4_addr("127.0.0.1", TEST_PORT));
+  ASSERT(0 == uv_ip4_addr("127.0.0.1", TEST_PORT, &addr));
+  sock = create_bound_socket(addr);
   context = create_server_context(sock);
 
   r = listen(sock, 100);
@@ -511,18 +507,22 @@ static void start_server() {
 }
 
 
-static void start_client() {
+static void start_client(void) {
   uv_os_sock_t sock;
   connection_context_t* context;
-  struct sockaddr_in server_addr = uv_ip4_addr("127.0.0.1", TEST_PORT);
+  struct sockaddr_in server_addr;
+  struct sockaddr_in addr;
   int r;
 
-  sock = create_nonblocking_bound_socket(uv_ip4_addr("0.0.0.0", 0));
+  ASSERT(0 == uv_ip4_addr("127.0.0.1", TEST_PORT, &server_addr));
+  ASSERT(0 == uv_ip4_addr("0.0.0.0", 0, &addr));
+
+  sock = create_bound_socket(addr);
   context = create_connection_context(sock, 0);
 
-  context->events = UV_READABLE | UV_WRITABLE;
+  context->events = UV_READABLE | UV_WRITABLE | UV_DISCONNECT;
   r = uv_poll_start(&context->poll_handle,
-                    UV_READABLE | UV_WRITABLE,
+                    UV_READABLE | UV_WRITABLE | UV_DISCONNECT,
                     connection_poll_cb);
   ASSERT(r == 0);
 
@@ -531,7 +531,7 @@ static void start_client() {
 }
 
 
-static void start_poll_test() {
+static void start_poll_test(void) {
   int i, r;
 
 #ifdef _WIN32
@@ -547,7 +547,7 @@ static void start_poll_test() {
   for (i = 0; i < NUM_CLIENTS; i++)
     start_client();
 
-  r = uv_run(uv_default_loop());
+  r = uv_run(uv_default_loop(), UV_RUN_DEFAULT);
   ASSERT(r == 0);
 
   /* Assert that at most five percent of the writable wakeups was spurious. */
@@ -556,6 +556,10 @@ static void start_poll_test() {
          spurious_writable_wakeups > 20);
 
   ASSERT(closed_connections == NUM_CLIENTS * 2);
+#ifndef _AIX
+  ASSERT(disconnects == NUM_CLIENTS * 2);
+#endif
+  MAKE_VALGRIND_HAPPY();
 }
 
 
@@ -569,5 +573,31 @@ TEST_IMPL(poll_duplex) {
 TEST_IMPL(poll_unidirectional) {
   test_mode = UNIDIRECTIONAL;
   start_poll_test();
+  return 0;
+}
+
+
+/* Windows won't let you open a directory so we open a file instead.
+ * OS X lets you poll a file so open the $PWD instead.  Both fail
+ * on Linux so it doesn't matter which one we pick.  Both succeed
+ * on FreeBSD, Solaris and AIX so skip the test on those platforms.
+ */
+TEST_IMPL(poll_bad_fdtype) {
+#if !defined(__DragonFly__) && !defined(__FreeBSD__) && !defined(__sun) && \
+    !defined(_AIX)
+  uv_poll_t poll_handle;
+  int fd;
+
+#if defined(_WIN32)
+  fd = open("test/fixtures/empty_file", O_RDONLY);
+#else
+  fd = open(".", O_RDONLY);
+#endif
+  ASSERT(fd != -1);
+  ASSERT(0 != uv_poll_init(uv_default_loop(), &poll_handle, fd));
+  ASSERT(0 == close(fd));
+#endif
+
+  MAKE_VALGRIND_HAPPY();
   return 0;
 }

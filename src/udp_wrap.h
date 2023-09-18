@@ -1,60 +1,77 @@
-#ifndef UDP_WRAP_H_
-#define UDP_WRAP_H_
+#ifndef SRC_UDP_WRAP_H_
+#define SRC_UDP_WRAP_H_
 
-#include "node.h"
-#include "req_wrap.h"
+#if defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS
+
+#include "async-wrap.h"
+#include "env.h"
 #include "handle_wrap.h"
+#include "req-wrap.h"
+#include "req-wrap-inl.h"
+#include "uv.h"
+#include "v8.h"
 
 namespace node {
 
-using v8::Object;
-using v8::Handle;
-using v8::Local;
-using v8::Value;
-using v8::String;
-using v8::Arguments;
-
 class UDPWrap: public HandleWrap {
  public:
-  static void Initialize(Handle<Object> target);
-  static Handle<Value> New(const Arguments& args);
-  static Handle<Value> Bind(const Arguments& args);
-  static Handle<Value> Send(const Arguments& args);
-  static Handle<Value> Bind6(const Arguments& args);
-  static Handle<Value> Send6(const Arguments& args);
-  static Handle<Value> RecvStart(const Arguments& args);
-  static Handle<Value> RecvStop(const Arguments& args);
-  static Handle<Value> GetSockName(const Arguments& args);
-  static Handle<Value> AddMembership(const Arguments& args);
-  static Handle<Value> DropMembership(const Arguments& args);
-  static Handle<Value> SetMulticastTTL(const Arguments& args);
-  static Handle<Value> SetMulticastLoopback(const Arguments& args);
-  static Handle<Value> SetBroadcast(const Arguments& args);
-  static Handle<Value> SetTTL(const Arguments& args);
-  static UDPWrap* Unwrap(Local<Object> obj);
+  static void Initialize(v8::Local<v8::Object> target,
+                         v8::Local<v8::Value> unused,
+                         v8::Local<v8::Context> context);
+  static void GetFD(v8::Local<v8::String>,
+                    const v8::PropertyCallbackInfo<v8::Value>&);
+  static void New(const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void Bind(const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void Send(const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void Bind6(const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void Send6(const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void RecvStart(const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void RecvStop(const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void GetSockName(const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void AddMembership(const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void DropMembership(const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void SetMulticastTTL(const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void SetMulticastLoopback(
+      const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void SetBroadcast(const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void SetTTL(const v8::FunctionCallbackInfo<v8::Value>& args);
 
+  static v8::Local<v8::Object> Instantiate(Environment* env, AsyncWrap* parent);
   uv_udp_t* UVHandle();
 
+  size_t self_size() const override { return sizeof(*this); }
+
  private:
-  UDPWrap(Handle<Object> object);
-  virtual ~UDPWrap();
+  typedef uv_udp_t HandleType;
 
-  static Handle<Value> DoBind(const Arguments& args, int family);
-  static Handle<Value> DoSend(const Arguments& args, int family);
-  static Handle<Value> SetMembership(const Arguments& args,
-                                     uv_membership membership);
+  template <typename T,
+            int (*F)(const typename T::HandleType*, sockaddr*, int*)>
+  friend void GetSockOrPeerName(const v8::FunctionCallbackInfo<v8::Value>&);
 
-  static uv_buf_t OnAlloc(uv_handle_t* handle, size_t suggested_size);
+  UDPWrap(Environment* env, v8::Local<v8::Object> object, AsyncWrap* parent);
+
+  static void DoBind(const v8::FunctionCallbackInfo<v8::Value>& args,
+                     int family);
+  static void DoSend(const v8::FunctionCallbackInfo<v8::Value>& args,
+                     int family);
+  static void SetMembership(const v8::FunctionCallbackInfo<v8::Value>& args,
+                            uv_membership membership);
+
+  static void OnAlloc(uv_handle_t* handle,
+                      size_t suggested_size,
+                      uv_buf_t* buf);
   static void OnSend(uv_udp_send_t* req, int status);
   static void OnRecv(uv_udp_t* handle,
                      ssize_t nread,
-                     uv_buf_t buf,
-                     struct sockaddr* addr,
-                     unsigned flags);
+                     const uv_buf_t* buf,
+                     const struct sockaddr* addr,
+                     unsigned int flags);
 
   uv_udp_t handle_;
 };
 
-} // namespace node
+}  // namespace node
 
-#endif // UDP_WRAP_H_
+#endif  // defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS
+
+#endif  // SRC_UDP_WRAP_H_

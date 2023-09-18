@@ -77,30 +77,30 @@ propertyNames.sort();
 assertEquals(1, propertyNames.length);
 assertEquals("getter", propertyNames[0]);
 
-try {
-  Object.getOwnPropertyNames(4);
-  assertTrue(false);
-} catch (e) {
-  assertTrue(/on non-object/.test(e));
-}
+// Check that implementation does not access Array.prototype.
+var savedConcat = Array.prototype.concat;
+Array.prototype.concat = function() { return []; }
+propertyNames = Object.getOwnPropertyNames({0: 'foo', bar: 'baz'});
+assertEquals(2, propertyNames.length);
+assertEquals('0', propertyNames[0]);
+assertEquals('bar', propertyNames[1]);
+assertSame(Array.prototype, propertyNames.__proto__);
+Array.prototype.concat = savedConcat;
 
-try {
-  Object.getOwnPropertyNames("foo");
-  assertTrue(false);
-} catch (e) {
-  assertTrue(/on non-object/.test(e));
-}
+assertEquals(Object.getOwnPropertyNames(4), []);
+assertEquals(Object.getOwnPropertyNames("foo"), ["0", "1", "2", "length"]);
+assertEquals(Object.getOwnPropertyNames(true), []);
 
 try {
   Object.getOwnPropertyNames(undefined);
   assertTrue(false);
 } catch (e) {
-  assertTrue(/on non-object/.test(e));
+  assertTrue(/Cannot convert undefined or null to object/.test(e));
 }
 
 try {
   Object.getOwnPropertyNames(null);
   assertTrue(false);
 } catch (e) {
-  assertTrue(/on non-object/.test(e));
+  assertTrue(/Cannot convert undefined or null to object/.test(e));
 }

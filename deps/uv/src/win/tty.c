@@ -22,7 +22,17 @@
 #include <assert.h>
 #include <io.h>
 #include <string.h>
-#include <stdint.h>
+#include <stdlib.h>
+
+#if defined(_MSC_VER) && _MSC_VER < 1600
+# include "stdint-msvc2008.h"
+#else
+# include <stdint.h>
+#endif
+
+#ifndef COMMON_LVB_REVERSE_VIDEO
+# define COMMON_LVB_REVERSE_VIDEO 0x4000
+#endif
 
 #include "uv.h"
 #include "internal.h"
@@ -42,12 +52,27 @@
 #define ANSI_IN_STRING        0x40
 #define ANSI_BACKSLASH_SEEN   0x80
 
+#define MAX_INPUT_BUFFER_LENGTH 8192
 
+
+static void uv_tty_capture_initial_style(CONSOLE_SCREEN_BUFFER_INFO* info);
 static void uv_tty_update_virtual_window(CONSOLE_SCREEN_BUFFER_INFO* info);
+static int uv__cancel_read_console(uv_tty_t* handle);
 
 
 /* Null uv_buf_t */
 static const uv_buf_t uv_null_buf_ = { 0, NULL };
+
+enum uv__read_console_status_e {
+  NOT_STARTED,
+  IN_PROGRESS,
+  TRAP_REQUESTED,
+  COMPLETED
+};
+
+static volatile LONG uv__read_console_status = NOT_STARTED;
+static volatile LONG uv__restore_screen_state;
+static CONSOLE_SCREEN_BUFFER_INFO uv__saved_screen_state;
 
 
 /*
@@ -82,6 +107,17 @@ static int uv_tty_virtual_width = -1;
 
 static CRITICAL_SECTION uv_tty_output_lock;
 
+static HANDLE uv_tty_output_handle = INVALID_HANDLE_VALUE;
+
+static WORD uv_tty_default_text_attributes =
+    FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
+
+static char uv_tty_default_fg_color = 7;
+static char uv_tty_default_bg_color = 0;
+static char uv_tty_default_fg_bright = 0;
+static char uv_tty_default_bg_bright = 0;
+static char uv_tty_default_inverse = 0;
+
 
 void uv_console_init() {
   InitializeCriticalSection(&uv_tty_output_lock);
@@ -89,85 +125,179 @@ void uv_console_init() {
 
 
 int uv_tty_init(uv_loop_t* loop, uv_tty_t* tty, uv_file fd, int readable) {
-  HANDLE win_handle;
-  CONSOLE_SCREEN_BUFFER_INFO info;
+  HANDLE handle;
+  CONSOLE_SCREEN_BUFFER_INFO screen_buffer_info;
 
-  loop->counters.tty_init++;
+  handle = (HANDLE) uv__get_osfhandle(fd);
+  if (handle == INVALID_HANDLE_VALUE)
+    return UV_EBADF;
 
-  win_handle = (HANDLE) _get_osfhandle(fd);
-  if (win_handle == INVALID_HANDLE_VALUE) {
-    uv__set_sys_error(loop, ERROR_INVALID_HANDLE);
-    return -1;
+  if (fd <= 2) {
+    /* In order to avoid closing a stdio file descriptor 0-2, duplicate the
+     * underlying OS handle and forget about the original fd.
+     * We could also opt to use the original OS handle and just never close it,
+     * but then there would be no reliable way to cancel pending read operations
+     * upon close.
+     */
+    if (!DuplicateHandle(INVALID_HANDLE_VALUE,
+                         handle,
+                         INVALID_HANDLE_VALUE,
+                         &handle,
+                         0,
+                         FALSE,
+                         DUPLICATE_SAME_ACCESS))
+      return uv_translate_sys_error(GetLastError());
+    fd = -1;
   }
 
-  if (!GetConsoleMode(win_handle, &tty->original_console_mode)) {
-    uv__set_sys_error(loop, GetLastError());
-    return -1;
-  }
+  if (!readable) {
+    /* Obtain the screen buffer info with the output handle. */
+    if (!GetConsoleScreenBufferInfo(handle, &screen_buffer_info)) {
+      return uv_translate_sys_error(GetLastError());
+    }
 
-  /* Initialize virtual window size; if it fails, assume that this is stdin. */
-  if (GetConsoleScreenBufferInfo(win_handle, &info)) {
+    /* Obtain the the tty_output_lock because the virtual window state is */
+    /* shared between all uv_tty_t handles. */
     EnterCriticalSection(&uv_tty_output_lock);
-    uv_tty_update_virtual_window(&info);
+
+    /* Store the global tty output handle. This handle is used by TTY read */
+    /* streams to update the virtual window when a CONSOLE_BUFFER_SIZE_EVENT */
+    /* is received. */
+    uv_tty_output_handle = handle;
+
+    /* Remember the original console text attributes. */
+    uv_tty_capture_initial_style(&screen_buffer_info);
+
+    uv_tty_update_virtual_window(&screen_buffer_info);
+
     LeaveCriticalSection(&uv_tty_output_lock);
   }
+
 
   uv_stream_init(loop, (uv_stream_t*) tty, UV_TTY);
   uv_connection_init((uv_stream_t*) tty);
 
-  tty->handle = win_handle;
-  tty->read_line_handle = NULL;
-  tty->read_line_buffer = uv_null_buf_;
-  tty->read_raw_wait = NULL;
+  tty->handle = handle;
+  tty->u.fd = fd;
   tty->reqs_pending = 0;
   tty->flags |= UV_HANDLE_BOUND;
 
-  /* Init keycode-to-vt100 mapper state. */
-  tty->last_key_len = 0;
-  tty->last_key_offset = 0;
-  tty->last_utf16_high_surrogate = 0;
-  memset(&tty->last_input_record, 0, sizeof tty->last_input_record);
+  if (readable) {
+    /* Initialize TTY input specific fields. */
+    tty->flags |= UV_HANDLE_TTY_READABLE | UV_HANDLE_READABLE;
+    /* TODO: remove me in v2.x. */
+    tty->tty.rd.unused_ = NULL;
+    tty->tty.rd.read_line_buffer = uv_null_buf_;
+    tty->tty.rd.read_raw_wait = NULL;
 
-  /* Init utf8-to-utf16 conversion state. */
-  tty->utf8_bytes_left = 0;
-  tty->utf8_codepoint = 0;
+    /* Init keycode-to-vt100 mapper state. */
+    tty->tty.rd.last_key_len = 0;
+    tty->tty.rd.last_key_offset = 0;
+    tty->tty.rd.last_utf16_high_surrogate = 0;
+    memset(&tty->tty.rd.last_input_record, 0, sizeof tty->tty.rd.last_input_record);
+  } else {
+    /* TTY output specific fields. */
+    tty->flags |= UV_HANDLE_WRITABLE;
 
-  /* Initialize eol conversion state */
-  tty->previous_eol = 0;
+    /* Init utf8-to-utf16 conversion state. */
+    tty->tty.wr.utf8_bytes_left = 0;
+    tty->tty.wr.utf8_codepoint = 0;
 
-  /* Init ANSI parser state. */
-  tty->ansi_parser_state = ANSI_NORMAL;
+    /* Initialize eol conversion state */
+    tty->tty.wr.previous_eol = 0;
+
+    /* Init ANSI parser state. */
+    tty->tty.wr.ansi_parser_state = ANSI_NORMAL;
+  }
 
   return 0;
 }
 
 
-int uv_tty_set_mode(uv_tty_t* tty, int mode) {
-  DWORD flags = 0;
+/* Set the default console text attributes based on how the console was
+ * configured when libuv started.
+ */
+static void uv_tty_capture_initial_style(CONSOLE_SCREEN_BUFFER_INFO* info) {
+  static int style_captured = 0;
+
+  /* Only do this once.
+     Assumption: Caller has acquired uv_tty_output_lock. */
+  if (style_captured)
+    return;
+
+  /* Save raw win32 attributes. */
+  uv_tty_default_text_attributes = info->wAttributes;
+
+  /* Convert black text on black background to use white text. */
+  if (uv_tty_default_text_attributes == 0)
+    uv_tty_default_text_attributes = 7;
+
+  /* Convert Win32 attributes to ANSI colors. */
+  uv_tty_default_fg_color = 0;
+  uv_tty_default_bg_color = 0;
+  uv_tty_default_fg_bright = 0;
+  uv_tty_default_bg_bright = 0;
+  uv_tty_default_inverse = 0;
+
+  if (uv_tty_default_text_attributes & FOREGROUND_RED)
+    uv_tty_default_fg_color |= 1;
+
+  if (uv_tty_default_text_attributes & FOREGROUND_GREEN)
+    uv_tty_default_fg_color |= 2;
+
+  if (uv_tty_default_text_attributes & FOREGROUND_BLUE)
+    uv_tty_default_fg_color |= 4;
+
+  if (uv_tty_default_text_attributes & BACKGROUND_RED)
+    uv_tty_default_bg_color |= 1;
+
+  if (uv_tty_default_text_attributes & BACKGROUND_GREEN)
+    uv_tty_default_bg_color |= 2;
+
+  if (uv_tty_default_text_attributes & BACKGROUND_BLUE)
+    uv_tty_default_bg_color |= 4;
+
+  if (uv_tty_default_text_attributes & FOREGROUND_INTENSITY)
+    uv_tty_default_fg_bright = 1;
+
+  if (uv_tty_default_text_attributes & BACKGROUND_INTENSITY)
+    uv_tty_default_bg_bright = 1;
+
+  if (uv_tty_default_text_attributes & COMMON_LVB_REVERSE_VIDEO)
+    uv_tty_default_inverse = 1;
+
+  style_captured = 1;
+}
+
+
+int uv_tty_set_mode(uv_tty_t* tty, uv_tty_mode_t mode) {
+  DWORD flags;
   unsigned char was_reading;
   uv_alloc_cb alloc_cb;
   uv_read_cb read_cb;
+  int err;
+
+  if (!(tty->flags & UV_HANDLE_TTY_READABLE)) {
+    return UV_EINVAL;
+  }
 
   if (!!mode == !!(tty->flags & UV_HANDLE_TTY_RAW)) {
     return 0;
   }
 
-  if (tty->original_console_mode & ENABLE_QUICK_EDIT_MODE) {
-    flags = ENABLE_QUICK_EDIT_MODE | ENABLE_EXTENDED_FLAGS;
-  }
-
-  if (mode) {
-    /* Raw input */
-    flags |= ENABLE_WINDOW_INPUT;
-  } else {
-    /* Line-buffered mode. */
-    flags |= ENABLE_ECHO_INPUT | ENABLE_INSERT_MODE | ENABLE_LINE_INPUT |
-        ENABLE_EXTENDED_FLAGS | ENABLE_PROCESSED_INPUT;
+  switch (mode) {
+    case UV_TTY_MODE_NORMAL:
+      flags = ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT;
+      break;
+    case UV_TTY_MODE_RAW:
+      flags = ENABLE_WINDOW_INPUT;
+      break;
+    case UV_TTY_MODE_IO:
+      return UV_ENOTSUP;
   }
 
   if (!SetConsoleMode(tty->handle, flags)) {
-    uv__set_sys_error(tty->loop, GetLastError());
-    return -1;
+    return uv_translate_sys_error(GetLastError());
   }
 
   /* If currently reading, stop, and restart reading. */
@@ -175,9 +305,9 @@ int uv_tty_set_mode(uv_tty_t* tty, int mode) {
     was_reading = 1;
     alloc_cb = tty->alloc_cb;
     read_cb = tty->read_cb;
-
-    if (was_reading && uv_tty_read_stop(tty) != 0) {
-      return -1;
+    err = uv_tty_read_stop(tty);
+    if (err) {
+      return uv_translate_sys_error(err);
     }
   } else {
     was_reading = 0;
@@ -188,8 +318,11 @@ int uv_tty_set_mode(uv_tty_t* tty, int mode) {
   tty->flags |= mode ? UV_HANDLE_TTY_RAW : 0;
 
   /* If we just stopped reading, restart. */
-  if (was_reading && uv_tty_read_start(tty, alloc_cb, read_cb) != 0) {
-    return -1;
+  if (was_reading) {
+    err = uv_tty_read_start(tty, alloc_cb, read_cb);
+    if (err) {
+      return uv_translate_sys_error(err);
+    }
   }
 
   return 0;
@@ -206,8 +339,7 @@ int uv_tty_get_winsize(uv_tty_t* tty, int* width, int* height) {
   CONSOLE_SCREEN_BUFFER_INFO info;
 
   if (!GetConsoleScreenBufferInfo(tty->handle, &info)) {
-    uv__set_sys_error(tty->loop, GetLastError());
-    return -1;
+    return uv_translate_sys_error(GetLastError());
   }
 
   EnterCriticalSection(&uv_tty_output_lock);
@@ -233,8 +365,8 @@ static void CALLBACK uv_tty_post_raw_read(void* data, BOOLEAN didTimeout) {
   handle = (uv_tty_t*) req->data;
   loop = handle->loop;
 
-  UnregisterWait(handle->read_raw_wait);
-  handle->read_raw_wait = NULL;
+  UnregisterWait(handle->tty.rd.read_raw_wait);
+  handle->tty.rd.read_raw_wait = NULL;
 
   SET_REQ_SUCCESS(req);
   POST_COMPLETION_FOR_REQ(loop, req);
@@ -250,19 +382,19 @@ static void uv_tty_queue_read_raw(uv_loop_t* loop, uv_tty_t* handle) {
 
   assert(handle->handle && handle->handle != INVALID_HANDLE_VALUE);
 
-  handle->read_line_buffer = uv_null_buf_;
+  handle->tty.rd.read_line_buffer = uv_null_buf_;
 
   req = &handle->read_req;
-  memset(&req->overlapped, 0, sizeof(req->overlapped));
+  memset(&req->u.io.overlapped, 0, sizeof(req->u.io.overlapped));
 
-  r = RegisterWaitForSingleObject(&handle->read_raw_wait,
+  r = RegisterWaitForSingleObject(&handle->tty.rd.read_raw_wait,
                                   handle->handle,
                                   uv_tty_post_raw_read,
                                   (void*) req,
                                   INFINITE,
                                   WT_EXECUTEINWAITTHREAD | WT_EXECUTEONLYONCE);
   if (!r) {
-    handle->read_raw_wait = NULL;
+    handle->tty.rd.read_raw_wait = NULL;
     SET_REQ_ERROR(req, GetLastError());
     uv_insert_pending_req(loop, (uv_req_t*)req);
   }
@@ -277,6 +409,10 @@ static DWORD CALLBACK uv_tty_line_read_thread(void* data) {
   uv_tty_t* handle;
   uv_req_t* req;
   DWORD bytes, read_bytes;
+  WCHAR utf16[MAX_INPUT_BUFFER_LENGTH / 3];
+  DWORD chars, read_chars;
+  LONG status;
+  COORD pos;
 
   assert(data);
 
@@ -284,26 +420,72 @@ static DWORD CALLBACK uv_tty_line_read_thread(void* data) {
   handle = (uv_tty_t*) req->data;
   loop = handle->loop;
 
-  assert(handle->read_line_buffer.base != NULL);
-  assert(handle->read_line_buffer.len > 0);
+  assert(handle->tty.rd.read_line_buffer.base != NULL);
+  assert(handle->tty.rd.read_line_buffer.len > 0);
 
   /* ReadConsole can't handle big buffers. */
-  if (handle->read_line_buffer.len < 8192) {
-    bytes = handle->read_line_buffer.len;
+  if (handle->tty.rd.read_line_buffer.len < MAX_INPUT_BUFFER_LENGTH) {
+    bytes = handle->tty.rd.read_line_buffer.len;
   } else {
-    bytes = 8192;
+    bytes = MAX_INPUT_BUFFER_LENGTH;
   }
 
-  /* Todo: Unicode */
-  if (ReadConsoleA(handle->read_line_handle,
-                   (void*) handle->read_line_buffer.base,
-                   bytes,
-                   &read_bytes,
-                   NULL)) {
+  /* At last, unicode! */
+  /* One utf-16 codeunit never takes more than 3 utf-8 codeunits to encode */
+  chars = bytes / 3;
+
+  status = InterlockedExchange(&uv__read_console_status, IN_PROGRESS);
+  if (status == TRAP_REQUESTED) {
     SET_REQ_SUCCESS(req);
-    req->overlapped.InternalHigh = read_bytes;
+    req->u.io.overlapped.InternalHigh = 0;
+    POST_COMPLETION_FOR_REQ(loop, req);
+    return 0;
+  }
+
+  if (ReadConsoleW(handle->handle,
+                   (void*) utf16,
+                   chars,
+                   &read_chars,
+                   NULL)) {
+    read_bytes = WideCharToMultiByte(CP_UTF8,
+                                     0,
+                                     utf16,
+                                     read_chars,
+                                     handle->tty.rd.read_line_buffer.base,
+                                     bytes,
+                                     NULL,
+                                     NULL);
+    SET_REQ_SUCCESS(req);
+    req->u.io.overlapped.InternalHigh = read_bytes;
   } else {
     SET_REQ_ERROR(req, GetLastError());
+  }
+
+  InterlockedExchange(&uv__read_console_status, COMPLETED);
+
+  /* If we canceled the read by sending a VK_RETURN event, restore the screen
+     state to undo the visual effect of the VK_RETURN*/
+  if (InterlockedOr(&uv__restore_screen_state, 0)) {
+    HANDLE active_screen_buffer = CreateFileA("conout$",
+                                         GENERIC_READ | GENERIC_WRITE,
+                                         FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                         NULL,
+                                         OPEN_EXISTING,
+                                         FILE_ATTRIBUTE_NORMAL,
+                                         NULL);
+    if (active_screen_buffer != INVALID_HANDLE_VALUE) {
+      pos = uv__saved_screen_state.dwCursorPosition;
+
+      /* If the cursor was at the bottom line of the screen buffer, the
+         VK_RETURN would have caused the buffer contents to scroll up by
+         one line. The right position to reset the cursor to is therefore one
+         line higher */
+      if (pos.Y == uv__saved_screen_state.dwSize.Y - 1)
+        pos.Y--;
+
+      SetConsoleCursorPosition(active_screen_buffer, pos);
+      CloseHandle(active_screen_buffer);
+    }
   }
 
   POST_COMPLETION_FOR_REQ(loop, req);
@@ -320,31 +502,22 @@ static void uv_tty_queue_read_line(uv_loop_t* loop, uv_tty_t* handle) {
   assert(handle->handle && handle->handle != INVALID_HANDLE_VALUE);
 
   req = &handle->read_req;
-  memset(&req->overlapped, 0, sizeof(req->overlapped));
+  memset(&req->u.io.overlapped, 0, sizeof(req->u.io.overlapped));
 
-  handle->read_line_buffer = handle->alloc_cb((uv_handle_t*) handle, 8192);
-  assert(handle->read_line_buffer.base != NULL);
-  assert(handle->read_line_buffer.len > 0);
-
-  /* Duplicate the console handle, so if we want to cancel the read, we can */
-  /* just close this handle duplicate. */
-  if (handle->read_line_handle == NULL) {
-    HANDLE this_process = GetCurrentProcess();
-    r = DuplicateHandle(this_process,
-                        handle->handle,
-                        this_process,
-                        &handle->read_line_handle,
-                        0,
-                        0,
-                        DUPLICATE_SAME_ACCESS);
-    if (!r) {
-      handle->read_line_handle = NULL;
-      SET_REQ_ERROR(req, GetLastError());
-      uv_insert_pending_req(loop, (uv_req_t*)req);
-      goto out;
-    }
+  handle->alloc_cb((uv_handle_t*) handle, 8192, &handle->tty.rd.read_line_buffer);
+  if (handle->tty.rd.read_line_buffer.len == 0) {
+    handle->read_cb((uv_stream_t*) handle,
+                    UV_ENOBUFS,
+                    &handle->tty.rd.read_line_buffer);
+    return;
   }
+  assert(handle->tty.rd.read_line_buffer.base != NULL);
 
+  /* Reset flags  No locking is required since there cannot be a line read
+     in progress. We are also relying on the memory barrier provided by
+     QueueUserWorkItem*/
+  uv__restore_screen_state = FALSE;
+  uv__read_console_status = NOT_STARTED;
   r = QueueUserWorkItem(uv_tty_line_read_thread,
                         (void*) req,
                         WT_EXECUTELONGFUNCTION);
@@ -353,7 +526,6 @@ static void uv_tty_queue_read_line(uv_loop_t* loop, uv_tty_t* handle) {
     uv_insert_pending_req(loop, (uv_req_t*)req);
   }
 
- out:
   handle->flags |= UV_HANDLE_READ_PENDING;
   handle->reqs_pending++;
 }
@@ -436,14 +608,15 @@ static const char* get_vt100_fn_key(DWORD code, char shift, char ctrl,
 
 void uv_process_tty_read_raw_req(uv_loop_t* loop, uv_tty_t* handle,
     uv_req_t* req) {
-  /* Shortcut for handle->last_input_record.Event.KeyEvent. */
-#define KEV handle->last_input_record.Event.KeyEvent
+  /* Shortcut for handle->tty.rd.last_input_record.Event.KeyEvent. */
+#define KEV handle->tty.rd.last_input_record.Event.KeyEvent
 
   DWORD records_left, records_read;
   uv_buf_t buf;
   off_t buf_used;
 
   assert(handle->type == UV_TTY);
+  assert(handle->flags & UV_HANDLE_TTY_READABLE);
   handle->flags &= ~UV_HANDLE_READ_PENDING;
 
   if (!(handle->flags & UV_HANDLE_READING) ||
@@ -455,18 +628,20 @@ void uv_process_tty_read_raw_req(uv_loop_t* loop, uv_tty_t* handle,
     /* An error occurred while waiting for the event. */
     if ((handle->flags & UV_HANDLE_READING)) {
       handle->flags &= ~UV_HANDLE_READING;
-      uv__set_sys_error(loop, GET_REQ_ERROR(req));
-      handle->read_cb((uv_stream_t*)handle, -1, uv_null_buf_);
+      handle->read_cb((uv_stream_t*)handle,
+                      uv_translate_sys_error(GET_REQ_ERROR(req)),
+                      &uv_null_buf_);
     }
     goto out;
   }
 
   /* Fetch the number of events  */
   if (!GetNumberOfConsoleInputEvents(handle->handle, &records_left)) {
-    uv__set_sys_error(loop, GetLastError());
     handle->flags &= ~UV_HANDLE_READING;
     DECREASE_ACTIVE_COUNT(loop, handle);
-    handle->read_cb((uv_stream_t*)handle, -1, uv_null_buf_);
+    handle->read_cb((uv_stream_t*)handle,
+                    uv_translate_sys_error(GetLastError()),
+                    &uv_null_buf_);
     goto out;
   }
 
@@ -475,24 +650,43 @@ void uv_process_tty_read_raw_req(uv_loop_t* loop, uv_tty_t* handle,
   buf = uv_null_buf_;
   buf_used = 0;
 
-  while ((records_left > 0 || handle->last_key_len > 0) &&
+  while ((records_left > 0 || handle->tty.rd.last_key_len > 0) &&
          (handle->flags & UV_HANDLE_READING)) {
-    if (handle->last_key_len == 0) {
+    if (handle->tty.rd.last_key_len == 0) {
       /* Read the next input record */
       if (!ReadConsoleInputW(handle->handle,
-                             &handle->last_input_record,
+                             &handle->tty.rd.last_input_record,
                              1,
                              &records_read)) {
-        uv__set_sys_error(loop, GetLastError());
         handle->flags &= ~UV_HANDLE_READING;
         DECREASE_ACTIVE_COUNT(loop, handle);
-        handle->read_cb((uv_stream_t*) handle, -1, buf);
+        handle->read_cb((uv_stream_t*) handle,
+                        uv_translate_sys_error(GetLastError()),
+                        &buf);
         goto out;
       }
       records_left--;
 
-      /* Ignore events that are not keyboard events */
-      if (handle->last_input_record.EventType != KEY_EVENT) {
+      /* If the window was resized, recompute the virtual window size. This */
+      /* will trigger a SIGWINCH signal if the window size changed in an */
+      /* way that matters to libuv. */
+      if (handle->tty.rd.last_input_record.EventType == WINDOW_BUFFER_SIZE_EVENT) {
+        CONSOLE_SCREEN_BUFFER_INFO info;
+
+        EnterCriticalSection(&uv_tty_output_lock);
+
+        if (uv_tty_output_handle != INVALID_HANDLE_VALUE &&
+            GetConsoleScreenBufferInfo(uv_tty_output_handle, &info)) {
+          uv_tty_update_virtual_window(&info);
+        }
+
+        LeaveCriticalSection(&uv_tty_output_lock);
+
+        continue;
+      }
+
+      /* Ignore other events that are not key or resize events. */
+      if (handle->tty.rd.last_input_record.EventType != KEY_EVENT) {
         continue;
       }
 
@@ -538,7 +732,7 @@ void uv_process_tty_read_raw_req(uv_loop_t* loop, uv_tty_t* handle,
         if (KEV.uChar.UnicodeChar >= 0xD800 &&
             KEV.uChar.UnicodeChar < 0xDC00) {
           /* UTF-16 high surrogate */
-          handle->last_utf16_high_surrogate = KEV.uChar.UnicodeChar;
+          handle->tty.rd.last_utf16_high_surrogate = KEV.uChar.UnicodeChar;
           continue;
         }
 
@@ -547,7 +741,7 @@ void uv_process_tty_read_raw_req(uv_loop_t* loop, uv_tty_t* handle,
         if ((KEV.dwControlKeyState & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED))
             && !(KEV.dwControlKeyState & (LEFT_CTRL_PRESSED |
             RIGHT_CTRL_PRESSED)) && KEV.bKeyDown) {
-          handle->last_key[0] = '\033';
+          handle->tty.rd.last_key[0] = '\033';
           prefix_len = 1;
         } else {
           prefix_len = 0;
@@ -556,14 +750,14 @@ void uv_process_tty_read_raw_req(uv_loop_t* loop, uv_tty_t* handle,
         if (KEV.uChar.UnicodeChar >= 0xDC00 &&
             KEV.uChar.UnicodeChar < 0xE000) {
           /* UTF-16 surrogate pair */
-          WCHAR utf16_buffer[2] = { handle->last_utf16_high_surrogate,
+          WCHAR utf16_buffer[2] = { handle->tty.rd.last_utf16_high_surrogate,
                                     KEV.uChar.UnicodeChar};
           char_len = WideCharToMultiByte(CP_UTF8,
                                          0,
                                          utf16_buffer,
                                          2,
-                                         &handle->last_key[prefix_len],
-                                         sizeof handle->last_key,
+                                         &handle->tty.rd.last_key[prefix_len],
+                                         sizeof handle->tty.rd.last_key,
                                          NULL,
                                          NULL);
         } else {
@@ -572,27 +766,28 @@ void uv_process_tty_read_raw_req(uv_loop_t* loop, uv_tty_t* handle,
                                          0,
                                          &KEV.uChar.UnicodeChar,
                                          1,
-                                         &handle->last_key[prefix_len],
-                                         sizeof handle->last_key,
+                                         &handle->tty.rd.last_key[prefix_len],
+                                         sizeof handle->tty.rd.last_key,
                                          NULL,
                                          NULL);
         }
 
         /* Whatever happened, the last character wasn't a high surrogate. */
-        handle->last_utf16_high_surrogate = 0;
+        handle->tty.rd.last_utf16_high_surrogate = 0;
 
         /* If the utf16 character(s) couldn't be converted something must */
         /* be wrong. */
         if (!char_len) {
-          uv__set_sys_error(loop, GetLastError());
           handle->flags &= ~UV_HANDLE_READING;
           DECREASE_ACTIVE_COUNT(loop, handle);
-          handle->read_cb((uv_stream_t*) handle, -1, buf);
+          handle->read_cb((uv_stream_t*) handle,
+                          uv_translate_sys_error(GetLastError()),
+                          &buf);
           goto out;
         }
 
-        handle->last_key_len = (unsigned char) (prefix_len + char_len);
-        handle->last_key_offset = 0;
+        handle->tty.rd.last_key_len = (unsigned char) (prefix_len + char_len);
+        handle->tty.rd.last_key_offset = 0;
         continue;
 
       } else {
@@ -614,33 +809,38 @@ void uv_process_tty_read_raw_req(uv_loop_t* loop, uv_tty_t* handle,
 
         /* Prefix with \x033 when the alt key was held. */
         if (KEV.dwControlKeyState & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED)) {
-          handle->last_key[0] = '\033';
+          handle->tty.rd.last_key[0] = '\033';
           prefix_len = 1;
         } else {
           prefix_len = 0;
         }
 
         /* Copy the vt100 sequence to the handle buffer. */
-        assert(prefix_len + vt100_len < sizeof handle->last_key);
-        memcpy(&handle->last_key[prefix_len], vt100, vt100_len);
+        assert(prefix_len + vt100_len < sizeof handle->tty.rd.last_key);
+        memcpy(&handle->tty.rd.last_key[prefix_len], vt100, vt100_len);
 
-        handle->last_key_len = (unsigned char) (prefix_len + vt100_len);
-        handle->last_key_offset = 0;
+        handle->tty.rd.last_key_len = (unsigned char) (prefix_len + vt100_len);
+        handle->tty.rd.last_key_offset = 0;
         continue;
       }
     } else {
       /* Copy any bytes left from the last keypress to the user buffer. */
-      if (handle->last_key_offset < handle->last_key_len) {
+      if (handle->tty.rd.last_key_offset < handle->tty.rd.last_key_len) {
         /* Allocate a buffer if needed */
         if (buf_used == 0) {
-          buf = handle->alloc_cb((uv_handle_t*) handle, 1024);
+          handle->alloc_cb((uv_handle_t*) handle, 1024, &buf);
+          if (buf.len == 0) {
+            handle->read_cb((uv_stream_t*) handle, UV_ENOBUFS, &buf);
+            goto out;
+          }
+          assert(buf.base != NULL);
         }
 
-        buf.base[buf_used++] = handle->last_key[handle->last_key_offset++];
+        buf.base[buf_used++] = handle->tty.rd.last_key[handle->tty.rd.last_key_offset++];
 
         /* If the buffer is full, emit it */
-        if (buf_used == buf.len) {
-          handle->read_cb((uv_stream_t*) handle, buf_used, buf);
+        if ((size_t) buf_used == buf.len) {
+          handle->read_cb((uv_stream_t*) handle, buf_used, &buf);
           buf = uv_null_buf_;
           buf_used = 0;
         }
@@ -650,18 +850,18 @@ void uv_process_tty_read_raw_req(uv_loop_t* loop, uv_tty_t* handle,
 
       /* Apply dwRepeat from the last input record. */
       if (--KEV.wRepeatCount > 0) {
-        handle->last_key_offset = 0;
+        handle->tty.rd.last_key_offset = 0;
         continue;
       }
 
-      handle->last_key_len = 0;
+      handle->tty.rd.last_key_len = 0;
       continue;
     }
   }
 
   /* Send the buffer back to the user */
   if (buf_used > 0) {
-    handle->read_cb((uv_stream_t*) handle, buf_used, buf);
+    handle->read_cb((uv_stream_t*) handle, buf_used, &buf);
   }
 
  out:
@@ -683,35 +883,37 @@ void uv_process_tty_read_line_req(uv_loop_t* loop, uv_tty_t* handle,
   uv_buf_t buf;
 
   assert(handle->type == UV_TTY);
+  assert(handle->flags & UV_HANDLE_TTY_READABLE);
 
-  buf = handle->read_line_buffer;
+  buf = handle->tty.rd.read_line_buffer;
 
   handle->flags &= ~UV_HANDLE_READ_PENDING;
-  handle->read_line_buffer = uv_null_buf_;
+  handle->tty.rd.read_line_buffer = uv_null_buf_;
 
   if (!REQ_SUCCESS(req)) {
     /* Read was not successful */
-    if ((handle->flags & UV_HANDLE_READING) &&
-        handle->read_line_handle != NULL) {
+    if (handle->flags & UV_HANDLE_READING) {
       /* Real error */
       handle->flags &= ~UV_HANDLE_READING;
       DECREASE_ACTIVE_COUNT(loop, handle);
-      uv__set_sys_error(loop, GET_REQ_ERROR(req));
-      handle->read_cb((uv_stream_t*) handle, -1, buf);
+      handle->read_cb((uv_stream_t*) handle,
+                      uv_translate_sys_error(GET_REQ_ERROR(req)),
+                      &buf);
     } else {
       /* The read was cancelled, or whatever we don't care */
-      uv__set_sys_error(loop, WSAEWOULDBLOCK); /* maps to UV_EAGAIN */
-      handle->read_cb((uv_stream_t*) handle, 0, buf);
+      handle->read_cb((uv_stream_t*) handle, 0, &buf);
     }
 
   } else {
-    /* Read successful */
-    /* TODO: read unicode, convert to utf-8 */
-    DWORD bytes = req->overlapped.InternalHigh;
-    if (bytes == 0) {
-      uv__set_sys_error(loop, WSAEWOULDBLOCK); /* maps to UV_EAGAIN */
+    if (!(handle->flags & UV_HANDLE_CANCELLATION_PENDING)) {
+      /* Read successful */
+      /* TODO: read unicode, convert to utf-8 */
+      DWORD bytes = req->u.io.overlapped.InternalHigh;
+      handle->read_cb((uv_stream_t*) handle, bytes, &buf);
+    } else {
+      handle->flags &= ~UV_HANDLE_CANCELLATION_PENDING;
+      handle->read_cb((uv_stream_t*) handle, 0, &buf);
     }
-    handle->read_cb((uv_stream_t*) handle, bytes, buf);
   }
 
   /* Wait for more input events. */
@@ -726,11 +928,13 @@ void uv_process_tty_read_line_req(uv_loop_t* loop, uv_tty_t* handle,
 
 void uv_process_tty_read_req(uv_loop_t* loop, uv_tty_t* handle,
     uv_req_t* req) {
+  assert(handle->type == UV_TTY);
+  assert(handle->flags & UV_HANDLE_TTY_READABLE);
 
   /* If the read_line_buffer member is zero, it must have been an raw read. */
   /* Otherwise it was a line-buffered read. */
   /* FIXME: This is quite obscure. Use a flag or something. */
-  if (handle->read_line_buffer.len == 0) {
+  if (handle->tty.rd.read_line_buffer.len == 0) {
     uv_process_tty_read_raw_req(loop, handle, req);
   } else {
     uv_process_tty_read_line_req(loop, handle, req);
@@ -741,6 +945,10 @@ void uv_process_tty_read_req(uv_loop_t* loop, uv_tty_t* handle,
 int uv_tty_read_start(uv_tty_t* handle, uv_alloc_cb alloc_cb,
     uv_read_cb read_cb) {
   uv_loop_t* loop = handle->loop;
+
+  if (!(handle->flags & UV_HANDLE_TTY_READABLE)) {
+    return ERROR_INVALID_PARAMETER;
+  }
 
   handle->flags |= UV_HANDLE_READING;
   INCREASE_ACTIVE_COUNT(loop, handle);
@@ -755,10 +963,10 @@ int uv_tty_read_start(uv_tty_t* handle, uv_alloc_cb alloc_cb,
 
   /* Maybe the user stopped reading half-way while processing key events. */
   /* Short-circuit if this could be the case. */
-  if (handle->last_key_len > 0) {
+  if (handle->tty.rd.last_key_len > 0) {
     SET_REQ_SUCCESS(&handle->read_req);
     uv_insert_pending_req(handle->loop, (uv_req_t*) &handle->read_req);
-    return -1;
+    return 0;
   }
 
   uv_tty_queue_read(loop, handle);
@@ -768,41 +976,91 @@ int uv_tty_read_start(uv_tty_t* handle, uv_alloc_cb alloc_cb,
 
 
 int uv_tty_read_stop(uv_tty_t* handle) {
-  uv_loop_t* loop = handle->loop;
+  INPUT_RECORD record;
+  DWORD written, err;
 
-  if (handle->flags & UV_HANDLE_READING) {
-    handle->flags &= ~UV_HANDLE_READING;
-    DECREASE_ACTIVE_COUNT(loop, handle);
-  }
+  handle->flags &= ~UV_HANDLE_READING;
+  DECREASE_ACTIVE_COUNT(handle->loop, handle);
 
-  /* Cancel raw read */
-  if ((handle->flags & UV_HANDLE_READ_PENDING) &&
-      (handle->flags & UV_HANDLE_TTY_RAW)) {
+  if (!(handle->flags & UV_HANDLE_READ_PENDING))
+    return 0;
+
+  if (handle->flags & UV_HANDLE_TTY_RAW) {
+    /* Cancel raw read */
     /* Write some bullshit event to force the console wait to return. */
-    INPUT_RECORD record;
-    DWORD written;
     memset(&record, 0, sizeof record);
     if (!WriteConsoleInputW(handle->handle, &record, 1, &written)) {
-      uv__set_sys_error(loop, GetLastError());
-      return -1;
+      return GetLastError();
     }
-  }
+  } else if (!(handle->flags & UV_HANDLE_CANCELLATION_PENDING)) {
+    /* Cancel line-buffered read if not already pending */
+    err = uv__cancel_read_console(handle);
+    if (err)
+      return err;
 
-  /* Cancel line-buffered read */
-  if (handle->read_line_handle != NULL) {
-    /* Closing this handle will cancel the ReadConsole operation */
-    CloseHandle(handle->read_line_handle);
-    handle->read_line_handle = NULL;
+    handle->flags |= UV_HANDLE_CANCELLATION_PENDING;
   }
-
 
   return 0;
 }
 
+static int uv__cancel_read_console(uv_tty_t* handle) {
+  HANDLE active_screen_buffer = INVALID_HANDLE_VALUE;
+  INPUT_RECORD record;
+  DWORD written;
+  DWORD err = 0;
+  LONG status;
+
+  assert(!(handle->flags & UV_HANDLE_CANCELLATION_PENDING));
+
+  status = InterlockedExchange(&uv__read_console_status, TRAP_REQUESTED);
+  if (status != IN_PROGRESS) {
+    /* Either we have managed to set a trap for the other thread before
+       ReadConsole is called, or ReadConsole has returned because the user
+       has pressed ENTER. In either case, there is nothing else to do. */
+    return 0;
+  }
+
+  /* Save screen state before sending the VK_RETURN event */
+  active_screen_buffer = CreateFileA("conout$",
+                                     GENERIC_READ | GENERIC_WRITE,
+                                     FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                     NULL,
+                                     OPEN_EXISTING,
+                                     FILE_ATTRIBUTE_NORMAL,
+                                     NULL);
+
+  if (active_screen_buffer != INVALID_HANDLE_VALUE &&
+      GetConsoleScreenBufferInfo(active_screen_buffer,
+                                 &uv__saved_screen_state)) {
+    InterlockedOr(&uv__restore_screen_state, 1);
+  }
+
+  /* Write enter key event to force the console wait to return. */
+  record.EventType = KEY_EVENT;
+  record.Event.KeyEvent.bKeyDown = TRUE;
+  record.Event.KeyEvent.wRepeatCount = 1;
+  record.Event.KeyEvent.wVirtualKeyCode = VK_RETURN;
+  record.Event.KeyEvent.wVirtualScanCode =
+    MapVirtualKeyW(VK_RETURN, MAPVK_VK_TO_VSC);
+  record.Event.KeyEvent.uChar.UnicodeChar = L'\r';
+  record.Event.KeyEvent.dwControlKeyState = 0;
+  if (!WriteConsoleInputW(handle->handle, &record, 1, &written))
+    err = GetLastError();
+
+  if (active_screen_buffer != INVALID_HANDLE_VALUE)
+    CloseHandle(active_screen_buffer);
+
+  return err;
+}
+
 
 static void uv_tty_update_virtual_window(CONSOLE_SCREEN_BUFFER_INFO* info) {
-  uv_tty_virtual_height = info->srWindow.Bottom - info->srWindow.Top + 1;
+  int old_virtual_width = uv_tty_virtual_width;
+  int old_virtual_height = uv_tty_virtual_height;
+
   uv_tty_virtual_width = info->dwSize.X;
+  uv_tty_virtual_height = info->srWindow.Bottom - info->srWindow.Top + 1;
 
   /* Recompute virtual window offset row. */
   if (uv_tty_virtual_offset == -1) {
@@ -819,6 +1077,14 @@ static void uv_tty_update_virtual_window(CONSOLE_SCREEN_BUFFER_INFO* info) {
   }
   if (uv_tty_virtual_offset < 0) {
     uv_tty_virtual_offset = 0;
+  }
+
+  /* If the virtual window size changed, emit a SIGWINCH signal. Don't emit */
+  /* if this was the first time the virtual window size was computed. */
+  if (old_virtual_width != -1 && old_virtual_height != -1 &&
+      (uv_tty_virtual_width != old_virtual_width ||
+       uv_tty_virtual_height != old_virtual_height)) {
+    uv__signal_dispatch(SIGWINCH);
   }
 }
 
@@ -913,7 +1179,7 @@ static int uv_tty_move_caret(uv_tty_t* handle, int x, unsigned char x_relative,
 
 static int uv_tty_reset(uv_tty_t* handle, DWORD* error) {
   const COORD origin = {0, 0};
-  const WORD char_attrs = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_RED;
+  const WORD char_attrs = uv_tty_default_text_attributes;
   CONSOLE_SCREEN_BUFFER_INFO info;
   DWORD count, written;
 
@@ -943,10 +1209,10 @@ static int uv_tty_reset(uv_tty_t* handle, DWORD* error) {
   count = info.dwSize.X * info.dwSize.Y;
 
   if (!(FillConsoleOutputCharacterW(handle->handle,
-                              L'\x20',
-                              count,
-                              origin,
-                              &written) &&
+                                    L'\x20',
+                                    count,
+                                    origin,
+                                    &written) &&
         FillConsoleOutputAttribute(handle->handle,
                                    char_attrs,
                                    written,
@@ -1048,22 +1314,32 @@ static int uv_tty_clear(uv_tty_t* handle, int dir, char entire_screen,
   return 0;
 }
 
+#define FLIP_FGBG                                                             \
+    do {                                                                      \
+      WORD fg = info.wAttributes & 0xF;                                       \
+      WORD bg = info.wAttributes & 0xF0;                                      \
+      info.wAttributes &= 0xFF00;                                             \
+      info.wAttributes |= fg << 4;                                            \
+      info.wAttributes |= bg >> 4;                                            \
+    } while (0)
 
 static int uv_tty_set_style(uv_tty_t* handle, DWORD* error) {
-  unsigned short argc = handle->ansi_csi_argc;
-  unsigned short* argv = handle->ansi_csi_argv;
+  unsigned short argc = handle->tty.wr.ansi_csi_argc;
+  unsigned short* argv = handle->tty.wr.ansi_csi_argv;
   int i;
   CONSOLE_SCREEN_BUFFER_INFO info;
 
   char fg_color = -1, bg_color = -1;
   char fg_bright = -1, bg_bright = -1;
+  char inverse = -1;
 
   if (argc == 0) {
     /* Reset mode */
-    fg_color = 7;
-    bg_color = 0;
-    fg_bright = 0;
-    bg_bright = 0;
+    fg_color = uv_tty_default_fg_color;
+    bg_color = uv_tty_default_bg_color;
+    fg_bright = uv_tty_default_fg_bright;
+    bg_bright = uv_tty_default_bg_bright;
+    inverse = uv_tty_default_inverse;
   }
 
   for (i = 0; i < argc; i++) {
@@ -1071,10 +1347,11 @@ static int uv_tty_set_style(uv_tty_t* handle, DWORD* error) {
 
     if (arg == 0) {
       /* Reset mode */
-      fg_color = 7;
-      bg_color = 0;
-      fg_bright = 0;
-      bg_bright = 0;
+      fg_color = uv_tty_default_fg_color;
+      bg_color = uv_tty_default_bg_color;
+      fg_bright = uv_tty_default_fg_bright;
+      bg_bright = uv_tty_default_bg_bright;
+      inverse = uv_tty_default_inverse;
 
     } else if (arg == 1) {
       /* Foreground bright on */
@@ -1089,6 +1366,10 @@ static int uv_tty_set_style(uv_tty_t* handle, DWORD* error) {
       /* Background bright on */
       bg_bright = 1;
 
+    } else if (arg == 7) {
+      /* Inverse: on */
+      inverse = 1;
+
     } else if (arg == 21 || arg == 22) {
       /* Foreground bright off */
       fg_bright = 0;
@@ -1097,14 +1378,18 @@ static int uv_tty_set_style(uv_tty_t* handle, DWORD* error) {
       /* Background bright off */
       bg_bright = 0;
 
+    } else if (arg == 27) {
+      /* Inverse: off */
+      inverse = 0;
+
     } else if (arg >= 30 && arg <= 37) {
       /* Set foreground color */
       fg_color = arg - 30;
 
     } else if (arg == 39) {
       /* Default text color */
-      fg_color = 7;
-      fg_bright = 0;
+      fg_color = uv_tty_default_fg_color;
+      fg_bright = uv_tty_default_fg_bright;
 
     } else if (arg >= 40 && arg <= 47) {
       /* Set background color */
@@ -1112,7 +1397,8 @@ static int uv_tty_set_style(uv_tty_t* handle, DWORD* error) {
 
     } else if (arg ==  49) {
       /* Default background color */
-      bg_color = 0;
+      bg_color = uv_tty_default_bg_color;
+      bg_bright = uv_tty_default_bg_bright;
 
     } else if (arg >= 90 && arg <= 97) {
       /* Set bold foreground color */
@@ -1128,7 +1414,7 @@ static int uv_tty_set_style(uv_tty_t* handle, DWORD* error) {
   }
 
   if (fg_color == -1 && bg_color == -1 && fg_bright == -1 &&
-      bg_bright == -1) {
+      bg_bright == -1 && inverse == -1) {
     /* Nothing changed */
     return 0;
   }
@@ -1136,6 +1422,10 @@ static int uv_tty_set_style(uv_tty_t* handle, DWORD* error) {
   if (!GetConsoleScreenBufferInfo(handle->handle, &info)) {
     *error = GetLastError();
     return -1;
+  }
+
+  if ((info.wAttributes & COMMON_LVB_REVERSE_VIDEO) > 0) {
+    FLIP_FGBG;
   }
 
   if (fg_color != -1) {
@@ -1168,6 +1458,18 @@ static int uv_tty_set_style(uv_tty_t* handle, DWORD* error) {
     }
   }
 
+  if (inverse != -1) {
+    if (inverse) {
+      info.wAttributes |= COMMON_LVB_REVERSE_VIDEO;
+    } else {
+      info.wAttributes &= ~COMMON_LVB_REVERSE_VIDEO;
+    }
+  }
+
+  if ((info.wAttributes & COMMON_LVB_REVERSE_VIDEO) > 0) {
+    FLIP_FGBG;
+  }
+
   if (!SetConsoleTextAttribute(handle->handle, info.wAttributes)) {
     *error = GetLastError();
     return -1;
@@ -1192,12 +1494,12 @@ static int uv_tty_save_state(uv_tty_t* handle, unsigned char save_attributes,
 
   uv_tty_update_virtual_window(&info);
 
-  handle->saved_position.X = info.dwCursorPosition.X;
-  handle->saved_position.Y = info.dwCursorPosition.Y - uv_tty_virtual_offset;
+  handle->tty.wr.saved_position.X = info.dwCursorPosition.X;
+  handle->tty.wr.saved_position.Y = info.dwCursorPosition.Y - uv_tty_virtual_offset;
   handle->flags |= UV_HANDLE_TTY_SAVED_POSITION;
 
   if (save_attributes) {
-    handle->saved_attributes = info.wAttributes &
+    handle->tty.wr.saved_attributes = info.wAttributes &
         (FOREGROUND_INTENSITY | BACKGROUND_INTENSITY);
     handle->flags |= UV_HANDLE_TTY_SAVED_ATTRIBUTES;
   }
@@ -1217,9 +1519,9 @@ static int uv_tty_restore_state(uv_tty_t* handle,
 
   if (handle->flags & UV_HANDLE_TTY_SAVED_POSITION) {
     if (uv_tty_move_caret(handle,
-                          handle->saved_position.X,
+                          handle->tty.wr.saved_position.X,
                           0,
-                          handle->saved_position.Y,
+                          handle->tty.wr.saved_position.Y,
                           0,
                           error) != 0) {
       return -1;
@@ -1235,7 +1537,7 @@ static int uv_tty_restore_state(uv_tty_t* handle,
 
     new_attributes = info.wAttributes;
     new_attributes &= ~(FOREGROUND_INTENSITY | BACKGROUND_INTENSITY);
-    new_attributes |= handle->saved_attributes;
+    new_attributes |= handle->tty.wr.saved_attributes;
 
     if (!SetConsoleTextAttribute(handle->handle, new_attributes)) {
       *error = GetLastError();
@@ -1246,14 +1548,35 @@ static int uv_tty_restore_state(uv_tty_t* handle,
   return 0;
 }
 
+static int uv_tty_set_cursor_visibility(uv_tty_t* handle,
+                                        BOOL visible,
+                                        DWORD* error) {
+  CONSOLE_CURSOR_INFO cursor_info;
 
-static int uv_tty_write_bufs(uv_tty_t* handle, uv_buf_t bufs[], int bufcnt,
-    DWORD* error) {
+  if (!GetConsoleCursorInfo(handle->handle, &cursor_info)) {
+    *error = GetLastError();
+    return -1;
+  }
+
+  cursor_info.bVisible = visible;
+
+  if (!SetConsoleCursorInfo(handle->handle, &cursor_info)) {
+    *error = GetLastError();
+    return -1;
+  }
+
+  return 0;
+}
+
+static int uv_tty_write_bufs(uv_tty_t* handle,
+                             const uv_buf_t bufs[],
+                             unsigned int nbufs,
+                             DWORD* error) {
   /* We can only write 8k characters at a time. Windows can't handle */
   /* much more characters in a single console write anyway. */
   WCHAR utf16_buf[8192];
   DWORD utf16_buf_used = 0;
-  int i;
+  unsigned int i;
 
 #define FLUSH_TEXT()                                                \
   do {                                                              \
@@ -1263,11 +1586,16 @@ static int uv_tty_write_bufs(uv_tty_t* handle, uv_buf_t bufs[], int bufcnt,
     }                                                               \
   } while (0)
 
+#define ENSURE_BUFFER_SPACE(wchars_needed)                          \
+  if (wchars_needed > ARRAY_SIZE(utf16_buf) - utf16_buf_used) {     \
+    FLUSH_TEXT();                                                   \
+  }
+
   /* Cache for fast access */
-  unsigned char utf8_bytes_left = handle->utf8_bytes_left;
-  unsigned int utf8_codepoint = handle->utf8_codepoint;
-  unsigned char previous_eol = handle->previous_eol;
-  unsigned char ansi_parser_state = handle->ansi_parser_state;
+  unsigned char utf8_bytes_left = handle->tty.wr.utf8_bytes_left;
+  unsigned int utf8_codepoint = handle->tty.wr.utf8_codepoint;
+  unsigned char previous_eol = handle->tty.wr.previous_eol;
+  unsigned char ansi_parser_state = handle->tty.wr.ansi_parser_state;
 
   /* Store the error here. If we encounter an error, stop trying to do i/o */
   /* but keep parsing the buffer so we leave the parser in a consistent */
@@ -1276,7 +1604,7 @@ static int uv_tty_write_bufs(uv_tty_t* handle, uv_buf_t bufs[], int bufcnt,
 
   EnterCriticalSection(&uv_tty_output_lock);
 
-  for (i = 0; i < bufcnt; i++) {
+  for (i = 0; i < nbufs; i++) {
     uv_buf_t buf = bufs[i];
     unsigned int j;
 
@@ -1344,7 +1672,7 @@ static int uv_tty_write_bufs(uv_tty_t* handle, uv_buf_t bufs[], int bufcnt,
 
           case 0233:
             ansi_parser_state = ANSI_CSI;
-            handle->ansi_csi_argc = 0;
+            handle->tty.wr.ansi_csi_argc = 0;
             continue;
         }
 
@@ -1352,7 +1680,7 @@ static int uv_tty_write_bufs(uv_tty_t* handle, uv_buf_t bufs[], int bufcnt,
         switch (utf8_codepoint) {
           case '[':
             ansi_parser_state = ANSI_CSI;
-            handle->ansi_csi_argc = 0;
+            handle->tty.wr.ansi_csi_argc = 0;
             continue;
 
           case '^':
@@ -1409,20 +1737,20 @@ static int uv_tty_write_bufs(uv_tty_t* handle, uv_buf_t bufs[], int bufcnt,
               /* We were not currently parsing a number */
 
               /* Check for too many arguments */
-              if (handle->ansi_csi_argc >= ARRAY_SIZE(handle->ansi_csi_argv)) {
+              if (handle->tty.wr.ansi_csi_argc >= ARRAY_SIZE(handle->tty.wr.ansi_csi_argv)) {
                 ansi_parser_state |= ANSI_IGNORE;
                 continue;
               }
 
               ansi_parser_state |= ANSI_IN_ARG;
-              handle->ansi_csi_argc++;
-              handle->ansi_csi_argv[handle->ansi_csi_argc - 1] =
+              handle->tty.wr.ansi_csi_argc++;
+              handle->tty.wr.ansi_csi_argv[handle->tty.wr.ansi_csi_argc - 1] =
                   (unsigned short) utf8_codepoint - '0';
               continue;
             } else {
               /* We were already parsing a number. Parse next digit. */
               uint32_t value = 10 *
-                  handle->ansi_csi_argv[handle->ansi_csi_argc - 1];
+                  handle->tty.wr.ansi_csi_argv[handle->tty.wr.ansi_csi_argc - 1];
 
               /* Check for overflow. */
               if (value > UINT16_MAX) {
@@ -1430,7 +1758,7 @@ static int uv_tty_write_bufs(uv_tty_t* handle, uv_buf_t bufs[], int bufcnt,
                 continue;
               }
 
-               handle->ansi_csi_argv[handle->ansi_csi_argc - 1] =
+               handle->tty.wr.ansi_csi_argv[handle->tty.wr.ansi_csi_argc - 1] =
                    (unsigned short) value + (utf8_codepoint - '0');
                continue;
             }
@@ -1445,18 +1773,25 @@ static int uv_tty_write_bufs(uv_tty_t* handle, uv_buf_t bufs[], int bufcnt,
               /* If ANSI_IN_ARG is not set, add another argument and */
               /* default it to 0. */
               /* Check for too many arguments */
-              if (handle->ansi_csi_argc >= ARRAY_SIZE(handle->ansi_csi_argv)) {
+              if (handle->tty.wr.ansi_csi_argc >= ARRAY_SIZE(handle->tty.wr.ansi_csi_argv)) {
                 ansi_parser_state |= ANSI_IGNORE;
                 continue;
               }
 
-              handle->ansi_csi_argc++;
-              handle->ansi_csi_argv[handle->ansi_csi_argc - 1] = 0;
+              handle->tty.wr.ansi_csi_argc++;
+              handle->tty.wr.ansi_csi_argv[handle->tty.wr.ansi_csi_argc - 1] = 0;
               continue;
             }
 
+          } else if (utf8_codepoint == '?' && !(ansi_parser_state & ANSI_IN_ARG) &&
+                     handle->tty.wr.ansi_csi_argc == 0) {
+            /* Ignores '?' if it is the first character after CSI[ */
+            /* This is an extension character from the VT100 codeset */
+            /* that is supported and used by most ANSI terminals today. */
+            continue;
+
           } else if (utf8_codepoint >= '@' && utf8_codepoint <= '~' &&
-                     (handle->ansi_csi_argc > 0 || utf8_codepoint != '[')) {
+                     (handle->tty.wr.ansi_csi_argc > 0 || utf8_codepoint != '[')) {
             int x, y, d;
 
             /* Command byte */
@@ -1464,50 +1799,50 @@ static int uv_tty_write_bufs(uv_tty_t* handle, uv_buf_t bufs[], int bufcnt,
               case 'A':
                 /* cursor up */
                 FLUSH_TEXT();
-                y = -(handle->ansi_csi_argc ? handle->ansi_csi_argv[0] : 1);
+                y = -(handle->tty.wr.ansi_csi_argc ? handle->tty.wr.ansi_csi_argv[0] : 1);
                 uv_tty_move_caret(handle, 0, 1, y, 1, error);
                 break;
 
               case 'B':
                 /* cursor down */
                 FLUSH_TEXT();
-                y = handle->ansi_csi_argc ? handle->ansi_csi_argv[0] : 1;
+                y = handle->tty.wr.ansi_csi_argc ? handle->tty.wr.ansi_csi_argv[0] : 1;
                 uv_tty_move_caret(handle, 0, 1, y, 1, error);
                 break;
 
               case 'C':
                 /* cursor forward */
                 FLUSH_TEXT();
-                x = handle->ansi_csi_argc ? handle->ansi_csi_argv[0] : 1;
+                x = handle->tty.wr.ansi_csi_argc ? handle->tty.wr.ansi_csi_argv[0] : 1;
                 uv_tty_move_caret(handle, x, 1, 0, 1, error);
                 break;
 
               case 'D':
                 /* cursor back */
                 FLUSH_TEXT();
-                x = -(handle->ansi_csi_argc ? handle->ansi_csi_argv[0] : 1);
+                x = -(handle->tty.wr.ansi_csi_argc ? handle->tty.wr.ansi_csi_argv[0] : 1);
                 uv_tty_move_caret(handle, x, 1, 0, 1, error);
                 break;
 
               case 'E':
                 /* cursor next line */
                 FLUSH_TEXT();
-                y = handle->ansi_csi_argc ? handle->ansi_csi_argv[0] : 1;
+                y = handle->tty.wr.ansi_csi_argc ? handle->tty.wr.ansi_csi_argv[0] : 1;
                 uv_tty_move_caret(handle, 0, 0, y, 1, error);
                 break;
 
               case 'F':
                 /* cursor previous line */
                 FLUSH_TEXT();
-                y = -(handle->ansi_csi_argc ? handle->ansi_csi_argv[0] : 1);
+                y = -(handle->tty.wr.ansi_csi_argc ? handle->tty.wr.ansi_csi_argv[0] : 1);
                 uv_tty_move_caret(handle, 0, 0, y, 1, error);
                 break;
 
               case 'G':
                 /* cursor horizontal move absolute */
                 FLUSH_TEXT();
-                x = (handle->ansi_csi_argc >= 1 && handle->ansi_csi_argv[0])
-                  ? handle->ansi_csi_argv[0] - 1 : 0;
+                x = (handle->tty.wr.ansi_csi_argc >= 1 && handle->tty.wr.ansi_csi_argv[0])
+                  ? handle->tty.wr.ansi_csi_argv[0] - 1 : 0;
                 uv_tty_move_caret(handle, x, 0, 0, 1, error);
                 break;
 
@@ -1515,17 +1850,17 @@ static int uv_tty_write_bufs(uv_tty_t* handle, uv_buf_t bufs[], int bufcnt,
               case 'f':
                 /* cursor move absolute */
                 FLUSH_TEXT();
-                y = (handle->ansi_csi_argc >= 1 && handle->ansi_csi_argv[0])
-                  ? handle->ansi_csi_argv[0] - 1 : 0;
-                x = (handle->ansi_csi_argc >= 2 && handle->ansi_csi_argv[1])
-                  ? handle->ansi_csi_argv[1] - 1 : 0;
+                y = (handle->tty.wr.ansi_csi_argc >= 1 && handle->tty.wr.ansi_csi_argv[0])
+                  ? handle->tty.wr.ansi_csi_argv[0] - 1 : 0;
+                x = (handle->tty.wr.ansi_csi_argc >= 2 && handle->tty.wr.ansi_csi_argv[1])
+                  ? handle->tty.wr.ansi_csi_argv[1] - 1 : 0;
                 uv_tty_move_caret(handle, x, 0, y, 0, error);
                 break;
 
               case 'J':
                 /* Erase screen */
                 FLUSH_TEXT();
-                d = handle->ansi_csi_argc ? handle->ansi_csi_argv[0] : 0;
+                d = handle->tty.wr.ansi_csi_argc ? handle->tty.wr.ansi_csi_argv[0] : 0;
                 if (d >= 0 && d <= 2) {
                   uv_tty_clear(handle, d, 1, error);
                 }
@@ -1534,7 +1869,7 @@ static int uv_tty_write_bufs(uv_tty_t* handle, uv_buf_t bufs[], int bufcnt,
               case 'K':
                 /* Erase line */
                 FLUSH_TEXT();
-                d = handle->ansi_csi_argc ? handle->ansi_csi_argv[0] : 0;
+                d = handle->tty.wr.ansi_csi_argc ? handle->tty.wr.ansi_csi_argv[0] : 0;
                 if (d >= 0 && d <= 2) {
                   uv_tty_clear(handle, d, 0, error);
                 }
@@ -1556,6 +1891,24 @@ static int uv_tty_write_bufs(uv_tty_t* handle, uv_buf_t bufs[], int bufcnt,
                 /* Restore the cursor position */
                 FLUSH_TEXT();
                 uv_tty_restore_state(handle, 0, error);
+                break;
+
+              case 'l':
+                /* Hide the cursor */
+                if (handle->tty.wr.ansi_csi_argc == 1 &&
+                    handle->tty.wr.ansi_csi_argv[0] == 25) {
+                  FLUSH_TEXT();
+                  uv_tty_set_cursor_visibility(handle, 0, error);
+                }
+                break;
+
+              case 'h':
+                /* Show the cursor */
+                if (handle->tty.wr.ansi_csi_argc == 1 &&
+                    handle->tty.wr.ansi_csi_argv[0] == 25) {
+                  FLUSH_TEXT();
+                  uv_tty_set_cursor_visibility(handle, 1, error);
+                }
                 break;
             }
 
@@ -1621,32 +1974,29 @@ static int uv_tty_write_bufs(uv_tty_t* handle, uv_buf_t bufs[], int bufcnt,
       }
 
       if (utf8_codepoint == 0x0a || utf8_codepoint == 0x0d) {
-        /* EOL conversion - emit \r\n, when we see either \r or \n. */
-        /* If a \n immediately follows a \r or vice versa, ignore it. */
-        if (previous_eol == 0 || utf8_codepoint == previous_eol) {
-          /* If there's no room in the utf16 buf, flush it first. */
-          if (2 > ARRAY_SIZE(utf16_buf) - utf16_buf_used) {
-            uv_tty_emit_text(handle, utf16_buf, utf16_buf_used, error);
-            utf16_buf_used = 0;
-          }
+        /* EOL conversion - emit \r\n when we see \n. */
 
+        if (utf8_codepoint == 0x0a && previous_eol != 0x0d) {
+          /* \n was not preceded by \r; print \r\n. */
+          ENSURE_BUFFER_SPACE(2);
           utf16_buf[utf16_buf_used++] = L'\r';
           utf16_buf[utf16_buf_used++] = L'\n';
-          previous_eol = (char) utf8_codepoint;
+        } else if (utf8_codepoint == 0x0d && previous_eol == 0x0a) {
+          /* \n was followed by \r; do not print the \r, since */
+          /* the source was either \r\n\r (so the second \r is */
+          /* redundant) or was \n\r (so the \n was processed */
+          /* by the last case and an \r automatically inserted). */
         } else {
-          /* Ignore this newline, but don't ignore later ones. */
-          previous_eol = 0;
+          /* \r without \n; print \r as-is. */
+          ENSURE_BUFFER_SPACE(1);
+          utf16_buf[utf16_buf_used++] = (WCHAR) utf8_codepoint;
         }
+
+        previous_eol = (char) utf8_codepoint;
 
       } else if (utf8_codepoint <= 0xffff) {
         /* Encode character into utf-16 buffer. */
-
-        /* If there's no room in the utf16 buf, flush it first. */
-        if (1 > ARRAY_SIZE(utf16_buf) - utf16_buf_used) {
-          uv_tty_emit_text(handle, utf16_buf, utf16_buf_used, error);
-          utf16_buf_used = 0;
-        }
-
+        ENSURE_BUFFER_SPACE(1);
         utf16_buf[utf16_buf_used++] = (WCHAR) utf8_codepoint;
         previous_eol = 0;
       }
@@ -1657,10 +2007,10 @@ static int uv_tty_write_bufs(uv_tty_t* handle, uv_buf_t bufs[], int bufcnt,
   FLUSH_TEXT();
 
   /* Copy cached values back to struct. */
-  handle->utf8_bytes_left = utf8_bytes_left;
-  handle->utf8_codepoint = utf8_codepoint;
-  handle->previous_eol = previous_eol;
-  handle->ansi_parser_state = ansi_parser_state;
+  handle->tty.wr.utf8_bytes_left = utf8_bytes_left;
+  handle->tty.wr.utf8_codepoint = utf8_codepoint;
+  handle->tty.wr.previous_eol = previous_eol;
+  handle->tty.wr.ansi_parser_state = ansi_parser_state;
 
   LeaveCriticalSection(&uv_tty_output_lock);
 
@@ -1674,15 +2024,13 @@ static int uv_tty_write_bufs(uv_tty_t* handle, uv_buf_t bufs[], int bufcnt,
 }
 
 
-int uv_tty_write(uv_loop_t* loop, uv_write_t* req, uv_tty_t* handle,
-    uv_buf_t bufs[], int bufcnt, uv_write_cb cb) {
+int uv_tty_write(uv_loop_t* loop,
+                 uv_write_t* req,
+                 uv_tty_t* handle,
+                 const uv_buf_t bufs[],
+                 unsigned int nbufs,
+                 uv_write_cb cb) {
   DWORD error;
-
-  if ((handle->flags & UV_HANDLE_SHUTTING) ||
-      (handle->flags & UV_HANDLE_CLOSING)) {
-    uv__set_sys_error(loop, WSAESHUTDOWN);
-    return -1;
-  }
 
   uv_req_init(loop, (uv_req_t*) req);
   req->type = UV_WRITE;
@@ -1690,12 +2038,12 @@ int uv_tty_write(uv_loop_t* loop, uv_write_t* req, uv_tty_t* handle,
   req->cb = cb;
 
   handle->reqs_pending++;
-  handle->write_reqs_pending++;
+  handle->stream.conn.write_reqs_pending++;
   REGISTER_HANDLE_REQ(loop, handle, req);
 
-  req->queued_bytes = 0;
+  req->u.io.queued_bytes = 0;
 
-  if (!uv_tty_write_bufs(handle, bufs, bufcnt, &error)) {
+  if (!uv_tty_write_bufs(handle, bufs, nbufs, &error)) {
     SET_REQ_SUCCESS(req);
   } else {
     SET_REQ_ERROR(req, error);
@@ -1707,20 +2055,36 @@ int uv_tty_write(uv_loop_t* loop, uv_write_t* req, uv_tty_t* handle,
 }
 
 
+int uv__tty_try_write(uv_tty_t* handle,
+                      const uv_buf_t bufs[],
+                      unsigned int nbufs) {
+  DWORD error;
+
+  if (handle->stream.conn.write_reqs_pending > 0)
+    return UV_EAGAIN;
+
+  if (uv_tty_write_bufs(handle, bufs, nbufs, &error))
+    return uv_translate_sys_error(error);
+
+  return uv__count_bufs(bufs, nbufs);
+}
+
+
 void uv_process_tty_write_req(uv_loop_t* loop, uv_tty_t* handle,
   uv_write_t* req) {
+  int err;
 
-  handle->write_queue_size -= req->queued_bytes;
+  handle->write_queue_size -= req->u.io.queued_bytes;
   UNREGISTER_HANDLE_REQ(loop, handle, req);
 
   if (req->cb) {
-    uv__set_sys_error(loop, GET_REQ_ERROR(req));
-    ((uv_write_cb)req->cb)(req, loop->last_err.code == UV_OK ? 0 : -1);
+    err = GET_REQ_ERROR(req);
+    req->cb(req, uv_translate_sys_error(err));
   }
 
-  handle->write_reqs_pending--;
-  if (handle->flags & UV_HANDLE_SHUTTING &&
-      handle->write_reqs_pending == 0) {
+  handle->stream.conn.write_reqs_pending--;
+  if (handle->stream.conn.shutdown_req != NULL &&
+      handle->stream.conn.write_reqs_pending == 0) {
     uv_want_endgame(loop, (uv_handle_t*)handle);
   }
 
@@ -1729,12 +2093,19 @@ void uv_process_tty_write_req(uv_loop_t* loop, uv_tty_t* handle,
 
 
 void uv_tty_close(uv_tty_t* handle) {
-  handle->flags |= UV_HANDLE_SHUTTING;
+  assert(handle->u.fd == -1 || handle->u.fd > 2);
+  if (handle->u.fd == -1)
+    CloseHandle(handle->handle);
+  else
+    close(handle->u.fd);
 
-  uv_tty_read_stop(handle);
-  CloseHandle(handle->handle);
+  if (handle->flags & UV_HANDLE_READING)
+    uv_tty_read_stop(handle);
 
-  uv__handle_start(handle);
+  handle->u.fd = -1;
+  handle->handle = INVALID_HANDLE_VALUE;
+  handle->flags &= ~(UV_HANDLE_READABLE | UV_HANDLE_WRITABLE);
+  uv__handle_closing(handle);
 
   if (handle->reqs_pending == 0) {
     uv_want_endgame(handle->loop, (uv_handle_t*) handle);
@@ -1743,39 +2114,34 @@ void uv_tty_close(uv_tty_t* handle) {
 
 
 void uv_tty_endgame(uv_loop_t* loop, uv_tty_t* handle) {
-  if ((handle->flags && UV_HANDLE_CONNECTION) &&
-      handle->shutdown_req != NULL &&
-      handle->write_reqs_pending == 0) {
-    UNREGISTER_HANDLE_REQ(loop, handle, handle->shutdown_req);
+  if (!(handle->flags & UV_HANDLE_TTY_READABLE) &&
+      handle->stream.conn.shutdown_req != NULL &&
+      handle->stream.conn.write_reqs_pending == 0) {
+    UNREGISTER_HANDLE_REQ(loop, handle, handle->stream.conn.shutdown_req);
 
     /* TTY shutdown is really just a no-op */
-    if (handle->shutdown_req->cb) {
-      if (handle->flags & UV_HANDLE_CLOSING) {
-        uv__set_sys_error(loop, WSAEINTR);
-        handle->shutdown_req->cb(handle->shutdown_req, -1);
+    if (handle->stream.conn.shutdown_req->cb) {
+      if (handle->flags & UV__HANDLE_CLOSING) {
+        handle->stream.conn.shutdown_req->cb(handle->stream.conn.shutdown_req, UV_ECANCELED);
       } else {
-        handle->shutdown_req->cb(handle->shutdown_req, 0);
+        handle->stream.conn.shutdown_req->cb(handle->stream.conn.shutdown_req, 0);
       }
     }
 
-    handle->shutdown_req = NULL;
+    handle->stream.conn.shutdown_req = NULL;
 
     DECREASE_PENDING_REQ_COUNT(handle);
     return;
   }
 
-  if (handle->flags & UV_HANDLE_CLOSING &&
+  if (handle->flags & UV__HANDLE_CLOSING &&
       handle->reqs_pending == 0) {
-    /* The console handle duplicate used for line reading should be destroyed */
-    /* by uv_tty_read_stop. */
-    assert(handle->read_line_handle == NULL);
-
     /* The wait handle used for raw reading should be unregistered when the */
     /* wait callback runs. */
-    assert(handle->read_raw_wait == NULL);
+    assert(!(handle->flags & UV_HANDLE_TTY_READABLE) ||
+           handle->tty.rd.read_raw_wait == NULL);
 
     assert(!(handle->flags & UV_HANDLE_CLOSED));
-    uv__handle_stop(handle);
     uv__handle_close(handle);
   }
 }
@@ -1795,7 +2161,7 @@ void uv_process_tty_connect_req(uv_loop_t* loop, uv_tty_t* handle,
 }
 
 
-void uv_tty_reset_mode() {
+int uv_tty_reset_mode(void) {
   /* Not necessary to do anything. */
-  ;
+  return 0;
 }

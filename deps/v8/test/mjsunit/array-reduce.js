@@ -418,8 +418,8 @@ try {
   exception = true;
   assertTrue(e instanceof TypeError,
              "reduce callback not a function not throwing TypeError");
-  assertEquals("called_non_callable", e.type,
-               "reduce non function TypeError type");
+  assertTrue(e.message.indexOf(" is not a function") >= 0,
+             "reduce non function TypeError type");
 }
 assertTrue(exception);
 
@@ -430,8 +430,8 @@ try {
   exception = true;
   assertTrue(e instanceof TypeError,
              "reduceRight callback not a function not throwing TypeError");
-  assertEquals("called_non_callable", e.type,
-               "reduceRight non function TypeError type");
+  assertTrue(e.message.indexOf(" is not a function") >= 0,
+             "reduceRight non function TypeError type");
 }
 assertTrue(exception);
 
@@ -442,7 +442,7 @@ try {
   exception = true;
   assertTrue(e instanceof TypeError,
              "reduce no initial value not throwing TypeError");
-  assertEquals("reduce_no_initial", e.type,
+  assertEquals("Reduce of empty array with no initial value", e.message,
                "reduce no initial TypeError type");
 }
 assertTrue(exception);
@@ -454,7 +454,7 @@ try {
   exception = true;
   assertTrue(e instanceof TypeError,
              "reduceRight no initial value not throwing TypeError");
-  assertEquals("reduce_no_initial", e.type,
+  assertEquals("Reduce of empty array with no initial value", e.message,
                "reduceRight no initial TypeError type");
 }
 assertTrue(exception);
@@ -466,7 +466,7 @@ try {
   exception = true;
   assertTrue(e instanceof TypeError,
              "reduce sparse no initial value not throwing TypeError");
-  assertEquals("reduce_no_initial", e.type,
+  assertEquals("Reduce of empty array with no initial value", e.message,
                "reduce no initial TypeError type");
 }
 assertTrue(exception);
@@ -478,7 +478,7 @@ try {
   exception = true;
   assertTrue(e instanceof TypeError,
              "reduceRight sparse no initial value not throwing TypeError");
-  assertEquals("reduce_no_initial", e.type,
+  assertEquals("Reduce of empty array with no initial value", e.message,
                "reduceRight no initial TypeError type");
 }
 assertTrue(exception);
@@ -521,3 +521,13 @@ testReduce("reduce", "ArrayManipulationExtender", 10,
             [3, 3, 2, [1, 2, 3, 4, 4, 5], 6],
             [6, 4, 3, [1, 2, 3, 4, 4, 5, 6], 10],
            ], arr, extender, 0);
+
+var arr = [];
+Object.defineProperty(arr, "0", { get: function() { delete this[0] },
+  configurable: true });
+assertEquals(undefined, arr.reduce(function(val) { return val }));
+
+var arr = [];
+Object.defineProperty(arr, "0", { get: function() { delete this[0] },
+  configurable: true});
+assertEquals(undefined, arr.reduceRight(function(val) { return val }));

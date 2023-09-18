@@ -25,7 +25,7 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-// Flags: --allow-natives-syntax --harmony-proxies --es5_readonly
+// Flags: --allow-natives-syntax
 
 // Different ways to create an object.
 
@@ -120,8 +120,13 @@ function ReadonlyByProto(o, name) {
   o.__proto__ = p;
 }
 
+// TODO(neis,cbruni): Enable once the necessary traps work again.
+// Allow Proxy to be undefined, so test can run in non-Harmony mode as well.
+var global = this;
+
 function ReadonlyByProxy(o, name) {
-  var p = Proxy.create({
+  if (!global.Proxy) return ReadonlyByFreeze(o, name);  // Dummy.
+  var p = new global.Proxy({}, {
     getPropertyDescriptor: function() {
       return {value: -46, writable: false, configurable: true};
     }
@@ -131,7 +136,7 @@ function ReadonlyByProxy(o, name) {
 
 var readonlys = [
   ReadonlyByNonwritableDataProperty, ReadonlyByAccessorPropertyWithoutSetter,
-  ReadonlyByGetter, ReadonlyByFreeze, ReadonlyByProto, ReadonlyByProxy
+  ReadonlyByGetter, ReadonlyByFreeze, ReadonlyByProto // ReadonlyByProxy
 ]
 
 function TestAllReadonlys(f) {

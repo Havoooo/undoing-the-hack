@@ -25,9 +25,11 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-// Flags: --allow-natives-syntax --hydrogen-filter=Debug.setBreakPoint --expose-debug-as debug
+// Flags: --allow-natives-syntax --hydrogen-filter=Debug.setBreakPoint
+// Flags: --expose-debug-as debug
 
 Debug = debug.Debug
+Debug.setListener(function(){});
 
 function f() {a=1;b=2};
 function g() {
@@ -45,3 +47,5 @@ Debug.clearBreakPoint(bp);
 %OptimizeFunctionOnNextCall(Debug.setBreakPoint);
 bp = Debug.setBreakPoint(f, 0, 0);
 Debug.clearBreakPoint(bp);
+
+Debug.setListener(null);

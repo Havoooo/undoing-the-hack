@@ -25,7 +25,7 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-// Flags: --expose-debug-as debug
+// Flags: --expose-debug-as debug --allow-natives-syntax
 // Get the Debug object exposed from the debug context global object.
 
 Debug = debug.Debug
@@ -87,13 +87,13 @@ function WrapInCatcher(f, holder) {
 
 function WrapInNativeCall(f) {
   return function() {
-    return Debug.ExecuteInDebugContext(f, true);
+    return %Call(f, undefined);
   };
 }
 
 function WrapInDebuggerCall(f) {
   return function() {
-    return Debug.ExecuteInDebugContext(f, false);
+    return %ExecuteInDebugContext(f);
   };
 }
 
@@ -138,4 +138,3 @@ test = new TestBase("Test with C++ frame above ChooseAnimal frame");
 exception_holder = {};
 assertEquals("Cat", test.ChooseAnimal(WrapInNativeCall(WrapInDebuggerCall(WrapInCatcher(test.ScriptChanger, exception_holder)))));
 assertTrue(!!exception_holder[0]);
-

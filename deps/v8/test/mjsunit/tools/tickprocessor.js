@@ -307,7 +307,7 @@ CppEntriesProviderMock.prototype.parseVmSymbols = function(
     name, startAddr, endAddr, symbolAdder) {
   var symbols = {
     'shell':
-        [['v8::internal::JSObject::LocalLookupRealNamedProperty(v8::internal::String*, v8::internal::LookupResult*)', 0x080f8800, 0x080f8d90],
+        [['v8::internal::JSObject::LookupOwnRealNamedProperty(v8::internal::String*, v8::internal::LookupResult*)', 0x080f8800, 0x080f8d90],
          ['v8::internal::HashTable<v8::internal::StringDictionaryShape, v8::internal::String*>::FindEntry(v8::internal::String*)', 0x080f8210, 0x080f8800],
          ['v8::internal::Runtime_Math_exp(v8::internal::Arguments)', 0x08123b20, 0x08123b80]],
     '/lib32/libm-2.7.so':
@@ -323,7 +323,7 @@ CppEntriesProviderMock.prototype.parseVmSymbols = function(
 
 
 function PrintMonitor(outputOrFileName) {
-  var expectedOut = typeof outputOrFileName == 'string' ?
+  var expectedOut = this.expectedOut = typeof outputOrFileName == 'string' ?
       this.loadExpectedOutput(outputOrFileName) : outputOrFileName;
   var outputPos = 0;
   var diffs = this.diffs = [];
@@ -359,7 +359,10 @@ PrintMonitor.prototype.loadExpectedOutput = function(fileName) {
 PrintMonitor.prototype.finish = function() {
   print = this.oldPrint;
   if (this.diffs.length > 0 || this.unexpectedOut != null) {
+    print("===== actual output: =====");
     print(this.realOut.join('\n'));
+    print("===== expected output: =====");
+    print(this.expectedOut.join('\n'));
     assertEquals([], this.diffs);
     assertNull(this.unexpectedOut);
   }
@@ -367,7 +370,7 @@ PrintMonitor.prototype.finish = function() {
 
 
 function driveTickProcessorTest(
-    separateIc, ignoreUnknown, stateFilter, logInput, refOutput) {
+    separateIc, ignoreUnknown, stateFilter, logInput, refOutput, onlySummary) {
   // TEST_FILE_NAME must be provided by test runner.
   assertEquals('string', typeof TEST_FILE_NAME);
   var pathLen = TEST_FILE_NAME.lastIndexOf('/');
@@ -380,7 +383,13 @@ function driveTickProcessorTest(
                              separateIc,
                              TickProcessor.CALL_GRAPH_SIZE,
                              ignoreUnknown,
-                             stateFilter);
+                             stateFilter,
+                             "0",
+                             "auto,auto",
+                             false,
+                             false,
+                             false,
+                             onlySummary);
   var pm = new PrintMonitor(testsPath + refOutput);
   tp.processLogFileInTest(testsPath + logInput);
   tp.printStatistics();
@@ -392,19 +401,23 @@ function driveTickProcessorTest(
   var testData = {
     'Default': [
       false, false, null,
-      'tickprocessor-test.log', 'tickprocessor-test.default'],
+      'tickprocessor-test.log', 'tickprocessor-test.default', false],
     'SeparateIc': [
       true, false, null,
-      'tickprocessor-test.log', 'tickprocessor-test.separate-ic'],
+      'tickprocessor-test.log', 'tickprocessor-test.separate-ic', false],
     'IgnoreUnknown': [
       false, true, null,
-      'tickprocessor-test.log', 'tickprocessor-test.ignore-unknown'],
+      'tickprocessor-test.log', 'tickprocessor-test.ignore-unknown', false],
     'GcState': [
       false, false, TickProcessor.VmStates.GC,
-      'tickprocessor-test.log', 'tickprocessor-test.gc-state'],
+      'tickprocessor-test.log', 'tickprocessor-test.gc-state', false],
     'FunctionInfo': [
       false, false, null,
-      'tickprocessor-test-func-info.log', 'tickprocessor-test.func-info']
+      'tickprocessor-test-func-info.log', 'tickprocessor-test.func-info',
+      false],
+    'OnlySummary': [
+      false, false, null,
+      'tickprocessor-test.log', 'tickprocessor-test.only-summary', true]
   };
   for (var testName in testData) {
     print('=== testProcessing-' + testName + ' ===');

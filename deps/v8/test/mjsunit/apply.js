@@ -25,6 +25,8 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+// Flags: --allow-natives-syntax
+
 function f0() {
   return this;
 }
@@ -112,17 +114,19 @@ function al() {
   return arguments.length + arguments[arguments.length - 1];
 }
 
-for (var j = 1; j < 0x40000000; j <<= 1) {
+for (var j = 1; j < 0x400000; j <<= 1) {
   try {
-    var a = new Array(j);
+    var a = %NormalizeElements([]);
+    a.length = j;
     a[j - 1] = 42;
     assertEquals(42 + j, al.apply(345, a));
   } catch (e) {
     assertTrue(e.toString().indexOf("Maximum call stack size exceeded") != -1);
-    for (; j < 0x40000000; j <<= 1) {
+    for (; j < 0x400000; j <<= 1) {
       var caught = false;
       try {
-        a = new Array(j);
+        a = %NormalizeElements([]);
+        a.length = j;
         a[j - 1] = 42;
         al.apply(345, a);
         assertUnreachable("Apply of array with length " + a.length +

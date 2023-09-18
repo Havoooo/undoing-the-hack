@@ -25,6 +25,8 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+// Flags: --allow-natives-syntax
+
 // Test date construction from other dates.
 var date0 = new Date(1111);
 var date1 = new Date(date0);
@@ -143,16 +145,6 @@ var l = new Date();
 l.setUTCMilliseconds();
 l.setUTCMilliseconds(2);
 assertTrue(isNaN(l.getUTCMilliseconds()));
-
-// Test that toLocaleTimeString only returns the time portion of the
-// date without the timezone information.
-function testToLocaleTimeString() {
-  var d = new Date();
-  var s = d.toLocaleTimeString();
-  assertEquals(8, s.length);
-}
-
-testToLocaleTimeString();
 
 // Test that -0 is treated correctly in MakeDay.
 var d = new Date();
@@ -319,3 +311,34 @@ for (var i = 0; i < 24; i++) {
     assertEquals(70674603500 - ms, Date.parse(string), string);
   }
 }
+
+assertThrows('Date.prototype.setTime.call("", 1);', TypeError);
+assertThrows('Date.prototype.setYear.call("", 1);', TypeError);
+assertThrows('Date.prototype.setHours.call("", 1, 2, 3, 4);', TypeError);
+assertThrows('Date.prototype.getDate.call("");', TypeError);
+assertThrows('Date.prototype.getUTCDate.call("");', TypeError);
+
+assertThrows(function() { Date.prototype.getTime.call(0) }, TypeError);
+assertThrows(function() { Date.prototype.getTime.call("") }, TypeError);
+
+assertThrows(function() { Date.prototype.getYear.call(0) }, TypeError);
+assertThrows(function() { Date.prototype.getYear.call("") }, TypeError);
+
+(function TestDatePrototypeOrdinaryObject() {
+  assertEquals(Object.prototype, Date.prototype.__proto__);
+  assertThrows(function () { Date.prototype.toString() }, TypeError);
+})();
+
+delete Date.prototype.getUTCFullYear;
+delete Date.prototype.getUTCMonth;
+delete Date.prototype.getUTCDate;
+delete Date.prototype.getUTCHours;
+delete Date.prototype.getUTCMinutes;
+delete Date.prototype.getUTCSeconds;
+delete Date.prototype.getUTCMilliseconds;
+(new Date()).toISOString();
+
+(function TestDeleteToString() {
+  assertTrue(delete Date.prototype.toString);
+  assertTrue('[object Date]' !== Date());
+})();

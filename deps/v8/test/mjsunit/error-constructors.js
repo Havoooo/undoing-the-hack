@@ -25,8 +25,6 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-// Flags: --allow-natives-syntax
-
 // Check that message and name are not enumerable on Error objects.
 var desc = Object.getOwnPropertyDescriptor(Error.prototype, 'name');
 assertFalse(desc['enumerable']);
@@ -35,10 +33,6 @@ assertFalse(desc['enumerable']);
 
 var e = new Error("foobar");
 desc = Object.getOwnPropertyDescriptor(e, 'message');
-assertFalse(desc['enumerable']);
-desc = Object.getOwnPropertyDescriptor(e, 'arguments');
-assertFalse(desc['enumerable']);
-desc = Object.getOwnPropertyDescriptor(e, 'type');
 assertFalse(desc['enumerable']);
 desc = Object.getOwnPropertyDescriptor(e, 'stack');
 assertFalse(desc['enumerable']);
@@ -57,51 +51,49 @@ for (var v in e) {
 function fail() { assertUnreachable(); };
 ReferenceError.prototype.__defineSetter__('name', fail);
 ReferenceError.prototype.__defineSetter__('message', fail);
-ReferenceError.prototype.__defineSetter__('type', fail);
-ReferenceError.prototype.__defineSetter__('arguments', fail);
 ReferenceError.prototype.__defineSetter__('stack', fail);
 
 var e = new ReferenceError();
 assertTrue(e.hasOwnProperty('stack'));
-assertTrue(e.hasOwnProperty('type'));
-assertTrue(e.hasOwnProperty('arguments'));
 
 var e = new ReferenceError('123');
 assertTrue(e.hasOwnProperty('message'));
 assertTrue(e.hasOwnProperty('stack'));
-assertTrue(e.hasOwnProperty('type'));
-assertTrue(e.hasOwnProperty('arguments'));
 
-var e = %MakeReferenceError("my_test_error", [0, 1]);
-assertTrue(e.hasOwnProperty('stack'));
-assertTrue(e.hasOwnProperty('type'));
-assertTrue(e.hasOwnProperty('arguments'));
-assertEquals("my_test_error", e.type)
-
-// Check that intercepting property access from toString is prevented for
-// compiler errors. This is not specified, but allowing interception
-// through a getter can leak error objects from different
-// script tags in the same context in a browser setting.
-var errors = [SyntaxError, ReferenceError, TypeError];
-for (var i in errors) {
-  var name = errors[i].prototype.toString();
-  // Monkey-patch prototype.
-  var props = ["name", "message", "type", "arguments", "stack"];
-  for (var j in props) {
-    errors[i].prototype.__defineGetter__(props[j], fail);
-  }
-  // String conversion should not invoke monkey-patched getters on prototype.
-  var e = new errors[i];
-  assertEquals(name, e.toString());
-  // Custom getters in actual objects are welcome.
-  e.__defineGetter__("name", function() { return "mine"; });
-  assertEquals("mine", e.toString());
+try {
+  eval("var error = reference");
+} catch (error) {
+  e = error;
 }
 
-// Monkey-patching non-static errors should still be observable.
+assertTrue(e.hasOwnProperty('stack'));
+
+// Check that intercepting property access from toString is prevented for
+// compiler errors. This is not specified, but allowing interception through a
+// getter can leak error objects from different script tags in the same context
+// in a browser setting. Use Realm.eval as a proxy for loading scripts. We
+// ignore the exception thrown from it since that would not be catchable from
+// user-land code.
+var errors = [SyntaxError, ReferenceError, TypeError, RangeError, URIError];
+var error_triggers = ["syntax error",
+                      "var error = reference",
+                      "undefined()",
+                      "String.fromCodePoint(0xFFFFFF)",
+                      "decodeURI('%F')"];
+for (var i in errors) {
+  // Monkey-patch prototype.
+  for (var prop of ["name", "message", "stack"]) {
+    errors[i].prototype.__defineGetter__(prop, fail);
+  }
+  // String conversion should not invoke monkey-patched getters on prototype.
+  assertThrows(()=>Realm.eval(0, error_triggers[i]));
+}
+
+// Monkey-patching non-internal errors should still be observable.
 function MyError() {}
 MyError.prototype = new Error;
-var errors = [Error, RangeError, EvalError, URIError, MyError];
+var errors = [Error, RangeError, EvalError, URIError,
+              SyntaxError, ReferenceError, TypeError, MyError];
 for (var i in errors) {
   errors[i].prototype.__defineGetter__("name", function() { return "my"; });
   errors[i].prototype.__defineGetter__("message", function() { return "moo"; });
@@ -111,7 +103,7 @@ for (var i in errors) {
 
 
 Error.prototype.toString = Object.prototype.toString;
-assertEquals("[object Error]", Error.prototype.toString());
+assertEquals("[object Object]", Error.prototype.toString());
 assertEquals(Object.prototype, Error.prototype.__proto__);
 var e = new Error("foo");
 assertEquals("[object Error]", e.toString());

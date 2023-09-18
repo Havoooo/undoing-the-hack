@@ -25,7 +25,7 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-// Flags: --expose-debug-as debug --harmony-scoping
+// Flags: --expose-debug-as debug
 // The functions used for testing backtraces. They are at the top to make the
 // testing of source line/column easier.
 
@@ -52,6 +52,7 @@ function listener(event, exec_state, event_data, data) {
     }
   } catch (e) {
     exception = e;
+    print(e + e.stack);
   }
 }
 
@@ -144,16 +145,8 @@ function CheckScopeContent(content, number, exec_state) {
   if (!scope.scopeObject().property('arguments').isUndefined()) {
     scope_size--;
   }
-  // Also ignore synthetic variable from catch block.
-  if (!scope.scopeObject().property('.catch-var').isUndefined()) {
-    scope_size--;
-  }
   // Skip property with empty name.
   if (!scope.scopeObject().property('').isUndefined()) {
-    scope_size--;
-  }
-  // Also ignore synthetic variable from block scopes.
-  if (!scope.scopeObject().property('.block').isUndefined()) {
     scope_size--;
   }
 

@@ -32,51 +32,13 @@
 # library.
 
 import os
-from os.path import dirname
 import re
 import sys
 import string
 
-sys.path.append(dirname(__file__) + "/../deps/v8/tools");
-import jsmin
-
 
 def ToCArray(filename, lines):
-  result = []
-  row = 1
-  col = 0
-  for chr in lines:
-    col += 1
-    if chr == "\n" or chr == "\r":
-      row += 1
-      col = 0
-
-    value = ord(chr)
-
-    if value >= 128:
-      print 'non-ascii value ' + filename + ':' + str(row) + ':' + str(col)
-      sys.exit(1);
-
-    result.append(str(value))
-  result.append("0")
-  return ", ".join(result)
-
-
-def CompressScript(lines, do_jsmin):
-  # If we're not expecting this code to be user visible, we can run it through
-  # a more aggressive minifier.
-  if do_jsmin:
-    minifier = JavaScriptMinifier()
-    return minifier.JSMinify(lines)
-
-  # Remove stuff from the source that we don't want to appear when
-  # people print the source code using Function.prototype.toString().
-  # Note that we could easily compress the scripts mode but don't
-  # since we want it to remain readable.
-  #lines = re.sub('//.*\n', '\n', lines) # end-of-line comments
-  #lines = re.sub(re.compile(r'/\*.*?\*/', re.DOTALL), '', lines) # comments.
-  #lines = re.sub('\s+\n+', '\n', lines) # trailing whitespace
-  return lines
+  return ','.join(str(ord(c)) for c in lines)
 
 
 def ReadFile(filename):
@@ -150,8 +112,9 @@ def ExpandMacros(lines, macros):
       result = macro.expand(mapping)
       # Replace the occurrence of the macro with the expansion
       lines = lines[:start] + result + lines[end:]
-      start = lines.find(name + '(', end)
+      start = lines.find(name + '(', start)
   return lines
+
 
 class TextMacro:
   def __init__(self, args, body):
@@ -206,7 +169,7 @@ def ReadMacros(lines):
           fun = eval("lambda " + ",".join(args) + ': ' + body)
           macros[name] = PythonMacro(args, fun)
         else:
-          raise ("Illegal line: " + line)
+          raise Exception("Illegal line: " + line)
   return (constants, macros)
 
 
@@ -219,17 +182,11 @@ namespace node {
 
 struct _native {
   const char* name;
-  const char* source;
+  const unsigned char* source;
   size_t source_len;
 };
 
-static const struct _native natives[] = {
-
-%(native_lines)s\
-
-  { NULL, NULL } /* sentinel */
-
-};
+static const struct _native natives[] = { %(native_lines)s };
 
 }
 #endif
@@ -237,11 +194,11 @@ static const struct _native natives[] = {
 
 
 NATIVE_DECLARATION = """\
-  { "%(id)s", %(id)s_native, sizeof(%(id)s_native)-1 },
+  { "%(id)s", %(escaped_id)s_native, sizeof(%(escaped_id)s_native) },
 """
 
 SOURCE_DECLARATION = """\
-  const char %(id)s_native[] = { %(data)s };
+  const unsigned char %(escaped_id)s_native[] = { %(data)s };
 """
 
 
@@ -266,12 +223,16 @@ def JS2C(source, target):
   # Locate the macros file name.
   consts = {}
   macros = {}
+  macro_lines = []
 
   for s in source:
-    if 'macros.py' == (os.path.split(str(s))[1]):
-      (consts, macros) = ReadMacros(ReadLines(str(s)))
+    if (os.path.split(str(s))[1]).endswith('macros.py'):
+      macro_lines.extend(ReadLines(str(s)))
     else:
       modules.append(s)
+
+  # Process input from all *macro.py files
+  (consts, macros) = ReadMacros(macro_lines)
 
   # Build source code lines
   source_lines = [ ]
@@ -282,22 +243,43 @@ def JS2C(source, target):
   for s in modules:
     delay = str(s).endswith('-delay.js')
     lines = ReadFile(str(s))
-    do_jsmin = lines.find('// jsminify this file, js2c: jsmin') != -1
 
     lines = ExpandConstants(lines, consts)
     lines = ExpandMacros(lines, macros)
-    lines = CompressScript(lines, do_jsmin)
     data = ToCArray(s, lines)
-    id = os.path.basename(str(s)).split('.')[0]
+
+    # On Windows, "./foo.bar" in the .gyp file is passed as "foo.bar"
+    # so don't assume there is always a slash in the file path.
+    if '/' in s or '\\' in s:
+      id = '/'.join(re.split('/|\\\\', s)[1:])
+    else:
+      id = s
+
+    if '.' in id:
+      id = id.split('.', 1)[0]
+
     if delay: id = id[:-6]
     if delay:
       delay_ids.append((id, len(lines)))
     else:
       ids.append((id, len(lines)))
-    source_lines.append(SOURCE_DECLARATION % { 'id': id, 'data': data })
-    source_lines_empty.append(SOURCE_DECLARATION % { 'id': id, 'data': 0 })
-    native_lines.append(NATIVE_DECLARATION % { 'id': id })
-  
+
+    escaped_id = id.replace('-', '_').replace('/', '_')
+    source_lines.append(SOURCE_DECLARATION % {
+      'id': id,
+      'escaped_id': escaped_id,
+      'data': data
+    })
+    source_lines_empty.append(SOURCE_DECLARATION % {
+      'id': id,
+      'escaped_id': escaped_id,
+      'data': 0
+    })
+    native_lines.append(NATIVE_DECLARATION % {
+      'id': id,
+      'escaped_id': escaped_id
+    })
+
   # Build delay support functions
   get_index_cases = [ ]
   get_script_source_cases = [ ]

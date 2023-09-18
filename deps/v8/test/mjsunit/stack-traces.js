@@ -64,13 +64,13 @@ function testNestedEval() {
 }
 
 function testEvalWithSourceURL() {
-  eval("function Doo() { FAIL; }; Doo();\n//@ sourceURL=res://name");
+  eval("function Doo() { FAIL; }; Doo();\n//# sourceURL=res://name");
 }
 
 function testNestedEvalWithSourceURL() {
   var x = "FAIL";
   var innerEval = 'function Inner() { eval(x); }\n//@ sourceURL=res://inner-eval';
-  eval("function Outer() { eval(innerEval); Inner(); }; Outer();\n//@ sourceURL=res://outer-eval");
+  eval("function Outer() { eval(innerEval); Inner(); }; Outer();\n//# sourceURL=res://outer-eval");
 }
 
 function testValue() {
@@ -92,6 +92,37 @@ function testRenamedMethod() {
 
 function testAnonymousMethod() {
   (function () { FAIL }).call([1, 2, 3]);
+}
+
+function testFunctionName() {
+  function gen(name, counter) {
+    var f = function foo() {
+      if (counter === 0) {
+        FAIL;
+      }
+      gen(name, counter - 1)();
+    }
+    if (counter === 4) {
+      Object.defineProperty(f, 'name', {get: function(){ throw 239; }});
+    } else if (counter == 3) {
+      Object.defineProperty(f, 'name', {value: 'boo' + '_' + counter});
+    } else {
+      Object.defineProperty(f, 'name', {writable: true});
+      if (counter === 2)
+        f.name = 42;
+      else
+        f.name = name + '_' + counter;
+    }
+    return f;
+  }
+  gen('foo', 4)();
+}
+
+function testFunctionInferredName() {
+  var f = function() {
+    FAIL;
+  }
+  f();
 }
 
 function CustomError(message, stripPoint) {
@@ -182,27 +213,11 @@ function testErrorsDuringFormatting() {
   Nasty.prototype.foo = function () { throw new RangeError(); };
   var n = new Nasty();
   n.__defineGetter__('constructor', function () { CONS_FAIL; });
-  var threw = false;
-  try {
-    n.foo();
-  } catch (e) {
-    threw = true;
-    assertTrue(e.stack.indexOf('<error: ReferenceError') != -1,
-               "ErrorsDuringFormatting didn't contain error: ReferenceError");
-  }
-  assertTrue(threw, "ErrorsDuringFormatting didn't throw");
-  threw = false;
+  assertThrows(()=>n.foo(), RangeError);
   // Now we can't even format the message saying that we couldn't format
   // the stack frame.  Put that in your pipe and smoke it!
   ReferenceError.prototype.toString = function () { NESTED_FAIL; };
-  try {
-    n.foo();
-  } catch (e) {
-    threw = true;
-    assertTrue(e.stack.indexOf('<error>') != -1,
-               "ErrorsDuringFormatting didn't contain <error>");
-  }
-  assertTrue(threw, "ErrorsDuringFormatting didnt' throw (2)");
+  assertThrows(()=>n.foo(), RangeError);
 }
 
 
@@ -261,6 +276,9 @@ testTrace("testValue", testValue, ["at Number.causeError"]);
 testTrace("testConstructor", testConstructor, ["new Plonk"]);
 testTrace("testRenamedMethod", testRenamedMethod, ["Wookie.a$b$c$d [as d]"]);
 testTrace("testAnonymousMethod", testAnonymousMethod, ["Array.<anonymous>"]);
+testTrace("testFunctionName", testFunctionName,
+    [" at foo_0 ", " at foo_1", " at foo ", " at boo_3 ", " at foo "]);
+testTrace("testFunctionInferredName", testFunctionInferredName, [" at f "]);
 testTrace("testDefaultCustomError", testDefaultCustomError,
     ["hep-hey", "new CustomError"],
     ["collectStackTrace"]);
@@ -273,13 +291,10 @@ testUnintendedCallerCensorship();
 testErrorsDuringFormatting();
 
 testTraceNativeConversion(String);  // Does ToString on argument.
-testTraceNativeConversion(Number);  // Does ToNumber on argument.
 testTraceNativeConversion(RegExp);  // Does ToString on argument.
 
 testTraceNativeConstructor(String);  // Does ToString on argument.
-testTraceNativeConstructor(Number);  // Does ToNumber on argument.
 testTraceNativeConstructor(RegExp);  // Does ToString on argument.
-testTraceNativeConstructor(Date);    // Does ToNumber on argument.
 
 // Omitted because QuickSort has builtins object as receiver, and is non-native
 // builtin.
@@ -289,3 +304,65 @@ testOmittedBuiltin(function(){ [thrower, 2].sort(function (a,b) {
 
 // Omitted because ADD from runtime.js is non-native builtin.
 testOmittedBuiltin(function(){ thrower + 2; }, "ADD");
+
+var error = new Error();
+error.toString = function() { assertUnreachable(); };
+error.stack;
+
+error = new Error();
+error.name = { toString: function() { assertUnreachable(); }};
+error.message = { toString: function() {  assertUnreachable(); }};
+error.stack;
+
+error = new Error();
+Array.prototype.push = function(x) { assertUnreachable(); };
+Array.prototype.join = function(x) { assertUnreachable(); };
+error.stack;
+
+var fired = false;
+error = new Error({ toString: function() { fired = true; } });
+assertTrue(fired);
+error.stack;
+assertTrue(fired);
+
+// Check that throwing exception in a custom stack trace formatting function
+// does not lead to recursion.
+Error.prepareStackTrace = function() { throw new Error("abc"); };
+var message;
+try {
+  try {
+    throw new Error();
+  } catch (e) {
+    e.stack;
+  }
+} catch (e) {
+  message = e.message;
+}
+
+assertEquals("abc", message);
+
+// Test that modifying Error.prepareStackTrace by itself works.
+Error.prepareStackTrace = function() { Error.prepareStackTrace = "custom"; };
+new Error().stack;
+
+assertEquals("custom", Error.prepareStackTrace);
+
+// Check that the formatted stack trace can be set to undefined.
+error = new Error();
+error.stack = undefined;
+assertEquals(undefined, error.stack);
+
+// Check that the stack trace accessors are not forcibly set.
+var my_error = {};
+Object.freeze(my_error);
+assertThrows(function() { Error.captureStackTrace(my_error); });
+
+my_error = {};
+Object.preventExtensions(my_error);
+assertThrows(function() { Error.captureStackTrace(my_error); });
+
+var fake_error = {};
+my_error = new Error();
+var stolen_getter = Object.getOwnPropertyDescriptor(my_error, 'stack').get;
+Object.defineProperty(fake_error, 'stack', { get: stolen_getter });
+assertEquals(undefined, fake_error.stack);

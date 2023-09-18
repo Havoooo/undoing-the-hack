@@ -67,8 +67,7 @@ var should_throw_on_null_and_undefined =
      String.prototype.toLocaleLowerCase,
      String.prototype.toUpperCase,
      String.prototype.toLocaleUpperCase,
-     String.prototype.trim,
-     Number.prototype.toLocaleString];
+     String.prototype.trim];
 
 // Non generic natives do not work on any input other than the specific
 // type, but since this change will allow call to be invoked with undefined
@@ -150,6 +149,12 @@ var reducing_functions =
     [Array.prototype.reduce,
      Array.prototype.reduceRight];
 
+function checkExpectedMessage(e) {
+  assertTrue(e.message.indexOf("called on null or undefined") >= 0 ||
+      e.message.indexOf("invoked on undefined or null value") >= 0 ||
+      e.message.indexOf("Cannot convert undefined or null to object") >= 0);
+}
+
 // Test that all natives using the ToObject call throw the right exception.
 for (var i = 0; i < should_throw_on_null_and_undefined.length; i++) {
   // Sanity check that all functions are correct
@@ -157,47 +162,40 @@ for (var i = 0; i < should_throw_on_null_and_undefined.length; i++) {
 
   var exception = false;
   try {
-    // We call all functions with no parameters, which means that essential
-    // parameters will have the undefined value.
-    // The test for whether the "this" value is null or undefined is always
-    // performed before access to the other parameters, so even if the
-    // undefined value is an invalid argument value, it mustn't change
-    // the result of the test.
-    should_throw_on_null_and_undefined[i].call(null);
+    // We need to pass a dummy object argument ({}) to these functions because
+    // of Object.prototype.isPrototypeOf's special behavior, see issue 3483
+    // for more details.
+    should_throw_on_null_and_undefined[i].call(null, {});
   } catch (e) {
     exception = true;
-    assertTrue("called_on_null_or_undefined" == e.type ||
-               "null_to_object" == e.type);
+    checkExpectedMessage(e);
   }
   assertTrue(exception);
 
   exception = false;
   try {
-    should_throw_on_null_and_undefined[i].call(undefined);
+    should_throw_on_null_and_undefined[i].call(undefined, {});
   } catch (e) {
     exception = true;
-    assertTrue("called_on_null_or_undefined" == e.type ||
-               "null_to_object" == e.type);
+    checkExpectedMessage(e);
   }
   assertTrue(exception);
 
   exception = false;
   try {
-    should_throw_on_null_and_undefined[i].apply(null);
+    should_throw_on_null_and_undefined[i].apply(null, [{}]);
   } catch (e) {
     exception = true;
-    assertTrue("called_on_null_or_undefined" == e.type ||
-               "null_to_object" == e.type);
+    checkExpectedMessage(e);
   }
   assertTrue(exception);
 
   exception = false;
   try {
-    should_throw_on_null_and_undefined[i].apply(undefined);
+    should_throw_on_null_and_undefined[i].apply(undefined, [{}]);
   } catch (e) {
     exception = true;
-    assertTrue("called_on_null_or_undefined" == e.type ||
-               "null_to_object" == e.type);
+    checkExpectedMessage(e);
   }
   assertTrue(exception);
 }
@@ -247,7 +245,9 @@ for (var i = 0; i < non_generic.length; i++) {
 
 // Test that we still throw when calling with thisArg null or undefined
 // through an array mapping function.
-var array = [1,2,3,4,5];
+// We need to make sure that the elements of `array` are all object values,
+// see issue 3483 for more details.
+var array = [{}, [], new Number, new Map, new WeakSet];
 for (var j = 0; j < mapping_functions.length; j++) {
   for (var i = 0; i < should_throw_on_null_and_undefined.length; i++) {
     exception = false;
@@ -257,8 +257,7 @@ for (var j = 0; j < mapping_functions.length; j++) {
                                 null);
     } catch (e) {
       exception = true;
-      assertTrue("called_on_null_or_undefined" == e.type ||
-                 "null_to_object" == e.type);
+      checkExpectedMessage(e);
     }
     assertTrue(exception);
 
@@ -269,8 +268,7 @@ for (var j = 0; j < mapping_functions.length; j++) {
                                 undefined);
     } catch (e) {
       exception = true;
-      assertTrue("called_on_null_or_undefined" == e.type ||
-                 "null_to_object" == e.type);
+      checkExpectedMessage(e);
     }
     assertTrue(exception);
   }
@@ -311,8 +309,7 @@ for (var j = 0; j < reducing_functions.length; j++) {
       reducing_functions[j].call(array, should_throw_on_null_and_undefined[i]);
     } catch (e) {
       exception = true;
-      assertTrue("called_on_null_or_undefined" == e.type ||
-                 "null_to_object" == e.type);
+      checkExpectedMessage(e);
     }
     assertTrue(exception);
 
@@ -321,8 +318,7 @@ for (var j = 0; j < reducing_functions.length; j++) {
       reducing_functions[j].call(array, should_throw_on_null_and_undefined[i]);
     } catch (e) {
       exception = true;
-      assertTrue("called_on_null_or_undefined" == e.type ||
-                 "null_to_object" == e.type);
+      checkExpectedMessage(e);
     }
     assertTrue(exception);
   }

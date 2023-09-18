@@ -33,7 +33,7 @@
 
 // HHasInstance.
 function f(value) {
-  if (%_IsSpecObject(value)) {
+  if (%_IsJSReceiver(value)) {
     if ((%_IsArray(value))) assertTrue(false);
   }
 }
@@ -54,4 +54,3 @@ function h(value) {
   }
 }
 h(undefined);
-

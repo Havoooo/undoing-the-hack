@@ -27,21 +27,22 @@
 
 #include <stdlib.h>
 
-#include "v8.h"
+#include "src/v8.h"
 
-#include "ast.h"
-#include "cctest.h"
+#include "src/ast/ast.h"
+#include "test/cctest/cctest.h"
 
 using namespace v8::internal;
 
 TEST(List) {
-  v8::internal::V8::Initialize(NULL);
   List<AstNode*>* list = new List<AstNode*>(0);
   CHECK_EQ(0, list->length());
 
-  ZoneScope zone_scope(Isolate::Current(), DELETE_ON_EXIT);
-  AstNodeFactory<AstNullVisitor> factory(Isolate::Current());
-  AstNode* node = factory.NewEmptyStatement();
+  v8::base::AccountingAllocator allocator;
+  Zone zone(&allocator);
+  AstValueFactory value_factory(&zone, 0);
+  AstNodeFactory factory(&value_factory);
+  AstNode* node = factory.NewEmptyStatement(RelocInfo::kNoPosition);
   list->Add(node);
   CHECK_EQ(1, list->length());
   CHECK_EQ(node, list->at(0));

@@ -6,10 +6,11 @@ import os
 import re
 import shutil
 import sys
+from getmoduleversion import get_version
 
 # set at init time
-dst_dir = None
-node_prefix = None # dst_dir without DESTDIR prefix
+node_prefix = '/usr/local' # PREFIX variable from Makefile
+install_path = None # base target directory (DESTDIR + PREFIX from Makefile)
 target_defaults = None
 variables = None
 
@@ -42,7 +43,7 @@ def try_mkdir_r(path):
 
 def try_rmdir_r(path):
   path = abspath(path)
-  while path.startswith(dst_dir):
+  while path.startswith(install_path):
     try:
       os.rmdir(path)
     except OSError, e:
@@ -53,9 +54,9 @@ def try_rmdir_r(path):
 
 def mkpaths(path, dst):
   if dst.endswith('/'):
-    target_path = abspath(dst_dir, dst, os.path.basename(path))
+    target_path = abspath(install_path, dst, os.path.basename(path))
   else:
-    target_path = abspath(dst_dir, dst)
+    target_path = abspath(install_path, dst)
   return path, target_path
 
 def try_copy(path, dst):
@@ -74,72 +75,12 @@ def try_remove(path, dst):
 def install(paths, dst): map(lambda path: try_copy(path, dst), paths)
 def uninstall(paths, dst): map(lambda path: try_remove(path, dst), paths)
 
-def waf_files(action):
-  action(['tools/node-waf'], 'bin/node-waf')
-  action(['tools/wafadmin/ansiterm.py',
-          'tools/wafadmin/Build.py',
-          'tools/wafadmin/Configure.py',
-          'tools/wafadmin/Constants.py',
-          'tools/wafadmin/Environment.py',
-          'tools/wafadmin/__init__.py',
-          'tools/wafadmin/Logs.py',
-          'tools/wafadmin/Node.py',
-          'tools/wafadmin/Options.py',
-          'tools/wafadmin/pproc.py',
-          'tools/wafadmin/py3kfixes.py',
-          'tools/wafadmin/Runner.py',
-          'tools/wafadmin/Scripting.py',
-          'tools/wafadmin/TaskGen.py',
-          'tools/wafadmin/Task.py',
-          'tools/wafadmin/Utils.py'],
-          'lib/node/wafadmin/')
-  action(['tools/wafadmin/Tools/ar.py',
-          'tools/wafadmin/Tools/cc.py',
-          'tools/wafadmin/Tools/ccroot.py',
-          'tools/wafadmin/Tools/compiler_cc.py',
-          'tools/wafadmin/Tools/compiler_cxx.py',
-          'tools/wafadmin/Tools/compiler_d.py',
-          'tools/wafadmin/Tools/config_c.py',
-          'tools/wafadmin/Tools/cxx.py',
-          'tools/wafadmin/Tools/dmd.py',
-          'tools/wafadmin/Tools/d.py',
-          'tools/wafadmin/Tools/gas.py',
-          'tools/wafadmin/Tools/gcc.py',
-          'tools/wafadmin/Tools/gdc.py',
-          'tools/wafadmin/Tools/gnu_dirs.py',
-          'tools/wafadmin/Tools/gob2.py',
-          'tools/wafadmin/Tools/gxx.py',
-          'tools/wafadmin/Tools/icc.py',
-          'tools/wafadmin/Tools/icpc.py',
-          'tools/wafadmin/Tools/__init__.py',
-          'tools/wafadmin/Tools/intltool.py',
-          'tools/wafadmin/Tools/libtool.py',
-          'tools/wafadmin/Tools/misc.py',
-          'tools/wafadmin/Tools/nasm.py',
-          'tools/wafadmin/Tools/node_addon.py',
-          'tools/wafadmin/Tools/osx.py',
-          'tools/wafadmin/Tools/preproc.py',
-          'tools/wafadmin/Tools/python.py',
-          'tools/wafadmin/Tools/suncc.py',
-          'tools/wafadmin/Tools/suncxx.py',
-          'tools/wafadmin/Tools/unittestw.py',
-          'tools/wafadmin/Tools/winres.py',
-          'tools/wafadmin/Tools/xlc.py',
-          'tools/wafadmin/Tools/xlcxx.py'],
-          'lib/node/wafadmin/Tools/')
-
-def update_shebang(path, shebang):
-  print 'updating shebang of %s to %s' % (path, shebang)
-  s = open(path, 'r').read()
-  s = re.sub(r'#!.*\n', '#!' + shebang + '\n', s)
-  open(path, 'w').write(s)
-
 def npm_files(action):
   target_path = 'lib/node_modules/npm/'
 
   # don't install npm if the target path is a symlink, it probably means
   # that a dev version of npm is installed there
-  if os.path.islink(abspath(dst_dir, target_path)): return
+  if os.path.islink(abspath(install_path, target_path)): return
 
   # npm has a *lot* of files and it'd be a pain to maintain a fixed list here
   # so we walk its source directory instead...
@@ -149,61 +90,93 @@ def npm_files(action):
     action(paths, target_path + dirname[9:] + '/')
 
   # create/remove symlink
-  link_path = abspath(dst_dir, 'bin/npm')
+  link_path = abspath(install_path, 'bin/npm')
   if action == uninstall:
     action([link_path], 'bin/npm')
   elif action == install:
     try_symlink('../lib/node_modules/npm/bin/npm-cli.js', link_path)
-    if os.environ.get('PORTABLE'):
-      # This crazy hack is necessary to make the shebang execute the copy
-      # of node relative to the same directory as the npm script. The precompiled
-      # binary tarballs use a prefix of "/" which gets translated to "/bin/node"
-      # in the regular shebang modifying logic, which is incorrect since the
-      # precompiled bundle should be able to be extracted anywhere and "just work"
-      shebang = '/bin/sh\n// 2>/dev/null; exec "`dirname "$0"`/node" "$0" "$@"'
-    else:
-      shebang = os.path.join(node_prefix, 'bin/node')
-    update_shebang(link_path, shebang)
   else:
     assert(0) # unhandled action type
 
+def subdir_files(path, dest, action):
+  ret = {}
+  for dirpath, dirnames, filenames in os.walk(path):
+    files = [dirpath + '/' + f for f in filenames if f.endswith('.h')]
+    ret[dest + dirpath.replace(path, '')] = files
+  for subdir, files in ret.items():
+    action(files, subdir + '/')
+
 def files(action):
-  action(['deps/uv/include/ares.h',
-          'deps/uv/include/ares_version.h',
-          'deps/uv/include/uv.h',
-          'deps/v8/include/v8-debug.h',
-          'deps/v8/include/v8-preparser.h',
-          'deps/v8/include/v8-profiler.h',
-          'deps/v8/include/v8-testing.h',
-          'deps/v8/include/v8.h',
-          'deps/v8/include/v8stdint.h',
-          'src/eio-emul.h',
-          'src/ev-emul.h',
-          'src/node.h',
-          'src/node_buffer.h',
-          'src/node_object_wrap.h',
-          'src/node_version.h'],
-          'include/node/')
-  action(['deps/uv/include/uv-private/eio.h',
-          'deps/uv/include/uv-private/ev.h',
-          'deps/uv/include/uv-private/ngx-queue.h',
-          'deps/uv/include/uv-private/tree.h',
-          'deps/uv/include/uv-private/uv-unix.h',
-          'deps/uv/include/uv-private/uv-win.h'],
-          'include/node/uv-private/')
-  action(['doc/node.1'], 'share/man/man1/')
-  action(['out/Release/node'], 'bin/node')
+  is_windows = sys.platform == 'win32'
+  output_file = 'node'
+  output_prefix = 'out/Release/'
 
-  # install unconditionally, checking if the platform supports dtrace doesn't
-  # work when cross-compiling and besides, there's at least one linux flavor
-  # with dtrace support now (oracle's "unbreakable" linux)
-  action(['src/node.d'], 'lib/dtrace/')
+  if 'false' == variables.get('node_shared'):
+    if is_windows:
+      output_file += '.exe'
+  else:
+    if is_windows:
+      output_file += '.dll'
+    else:
+      # GYP will output to lib.target, this is hardcoded in its source,
+      # see the _InstallableTargetInstallPath function.
+      output_prefix += 'lib.target/'
+      output_file = 'lib' + output_file + '.so.' + get_version()
 
-  if 'true' == variables.get('node_install_waf'): waf_files(action)
+  action([output_prefix + output_file], 'bin/' + output_file)
+
+  if 'true' == variables.get('node_use_dtrace'):
+    action(['out/Release/node.d'], 'lib/dtrace/node.d')
+
+  # behave similarly for systemtap
+  action(['src/node.stp'], 'share/systemtap/tapset/')
+
+  action(['deps/v8/tools/gdbinit'], 'share/doc/node/')
+
+  if 'freebsd' in sys.platform or 'openbsd' in sys.platform:
+    action(['doc/node.1'], 'man/man1/')
+  else:
+    action(['doc/node.1'], 'share/man/man1/')
+
   if 'true' == variables.get('node_install_npm'): npm_files(action)
 
+  headers(action)
+
+def headers(action):
+  action([
+    'common.gypi',
+    'config.gypi',
+    'src/node.h',
+    'src/node_buffer.h',
+    'src/node_object_wrap.h',
+    'src/node_version.h',
+  ], 'include/node/')
+
+  # Add the expfile that is created on AIX
+  if sys.platform.startswith('aix'):
+    action(['out/Release/node.exp'], 'include/node/')
+
+  subdir_files('deps/v8/include', 'include/node/', action)
+
+  if 'false' == variables.get('node_shared_cares'):
+    subdir_files('deps/cares/include', 'include/node/', action)
+
+  if 'false' == variables.get('node_shared_libuv'):
+    subdir_files('deps/uv/include', 'include/node/', action)
+
+  if 'false' == variables.get('node_shared_openssl'):
+    subdir_files('deps/openssl/openssl/include/openssl', 'include/node/openssl/', action)
+    subdir_files('deps/openssl/config/archs', 'include/node/openssl/archs', action)
+    action(['deps/openssl/config/opensslconf.h'], 'include/node/openssl/')
+
+  if 'false' == variables.get('node_shared_zlib'):
+    action([
+      'deps/zlib/zconf.h',
+      'deps/zlib/zlib.h',
+    ], 'include/node/')
+
 def run(args):
-  global dst_dir, node_prefix, target_defaults, variables
+  global node_prefix, install_path, target_defaults, variables
 
   # chdir to the project's top-level directory
   os.chdir(abspath(os.path.dirname(__file__), '..'))
@@ -213,12 +186,25 @@ def run(args):
   target_defaults = conf['target_defaults']
 
   # argv[2] is a custom install prefix for packagers (think DESTDIR)
-  dst_dir = node_prefix = variables.get('node_prefix') or '/usr/local'
-  if len(args) > 2: dst_dir = abspath(args[2] + '/' + dst_dir)
+  # argv[3] is a custom install prefix (think PREFIX)
+  # Difference is that dst_dir won't be included in shebang lines etc.
+  dst_dir = args[2] if len(args) > 2 else ''
+
+  if len(args) > 3:
+    node_prefix = args[3]
+
+  # install_path thus becomes the base target directory.
+  install_path = dst_dir + node_prefix + '/'
 
   cmd = args[1] if len(args) > 1 else 'install'
-  if cmd == 'install': return files(install)
-  if cmd == 'uninstall': return files(uninstall)
+
+  if os.environ.get('HEADERS_ONLY'):
+    if cmd == 'install': return headers(install)
+    if cmd == 'uninstall': return headers(uninstall)
+  else:
+    if cmd == 'install': return files(install)
+    if cmd == 'uninstall': return files(uninstall)
+
   raise RuntimeError('Bad command: %s\n' % cmd)
 
 if __name__ == '__main__':

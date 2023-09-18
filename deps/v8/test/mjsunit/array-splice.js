@@ -116,12 +116,37 @@
     assertEquals([1, 2, 3, 4, 5, 6, 7], spliced);
 
     array = [1, 2, 3, 4, 5, 6, 7];
+    spliced = array.splice(-1e100);
+    assertEquals([], array);
+    assertEquals([1, 2, 3, 4, 5, 6, 7], spliced);
+
+    array = [1, 2, 3, 4, 5, 6, 7];
     spliced = array.splice(-3);
     assertEquals([1, 2, 3, 4], array);
     assertEquals([5, 6, 7], spliced);
 
     array = [1, 2, 3, 4, 5, 6, 7];
+    spliced = array.splice(-3.999999);
+    assertEquals([1, 2, 3, 4], array);
+    assertEquals([5, 6, 7], spliced);
+
+    array = [1, 2, 3, 4, 5, 6, 7];
+    spliced = array.splice(-3.000001);
+    assertEquals([1, 2, 3, 4], array);
+    assertEquals([5, 6, 7], spliced);
+
+    array = [1, 2, 3, 4, 5, 6, 7];
     spliced = array.splice(4);
+    assertEquals([1, 2, 3, 4], array);
+    assertEquals([5, 6, 7], spliced);
+
+    array = [1, 2, 3, 4, 5, 6, 7];
+    spliced = array.splice(4.999999);
+    assertEquals([1, 2, 3, 4], array);
+    assertEquals([5, 6, 7], spliced);
+
+    array = [1, 2, 3, 4, 5, 6, 7];
+    spliced = array.splice(4.000001);
     assertEquals([1, 2, 3, 4], array);
     assertEquals([5, 6, 7], spliced);
 
@@ -146,7 +171,17 @@
     assertEquals([], spliced);
 
     array = [1, 2, 3, 4, 5, 6, 7];
+    spliced = array.splice(1e100);
+    assertEquals([1, 2, 3, 4, 5, 6, 7], array);
+    assertEquals([], spliced);
+
+    array = [1, 2, 3, 4, 5, 6, 7];
     spliced = array.splice(0, -100);
+    assertEquals([1, 2, 3, 4, 5, 6, 7], array);
+    assertEquals([], spliced);
+
+    array = [1, 2, 3, 4, 5, 6, 7];
+    spliced = array.splice(0, -1e100);
     assertEquals([1, 2, 3, 4, 5, 6, 7], array);
     assertEquals([], spliced);
 
@@ -156,7 +191,27 @@
     assertEquals([], spliced);
 
     array = [1, 2, 3, 4, 5, 6, 7];
+    spliced = array.splice(0, -3.999999);
+    assertEquals([1, 2, 3, 4, 5, 6, 7], array);
+    assertEquals([], spliced);
+
+    array = [1, 2, 3, 4, 5, 6, 7];
+    spliced = array.splice(0, -3.000001);
+    assertEquals([1, 2, 3, 4, 5, 6, 7], array);
+    assertEquals([], spliced);
+
+    array = [1, 2, 3, 4, 5, 6, 7];
     spliced = array.splice(0, 4);
+    assertEquals([5, 6, 7], array);
+    assertEquals([1, 2, 3, 4], spliced);
+
+    array = [1, 2, 3, 4, 5, 6, 7];
+    spliced = array.splice(0, 4.999999);
+    assertEquals([5, 6, 7], array);
+    assertEquals([1, 2, 3, 4], spliced);
+
+    array = [1, 2, 3, 4, 5, 6, 7];
+    spliced = array.splice(0, 4.000001);
     assertEquals([5, 6, 7], array);
     assertEquals([1, 2, 3, 4], spliced);
 
@@ -177,6 +232,11 @@
 
     array = [1, 2, 3, 4, 5, 6, 7];
     spliced = array.splice(0, 100);
+    assertEquals([], array);
+    assertEquals([1, 2, 3, 4, 5, 6, 7], spliced);
+
+    array = [1, 2, 3, 4, 5, 6, 7];
+    spliced = array.splice(0, 1e100);
     assertEquals([], array);
     assertEquals([1, 2, 3, 4, 5, 6, 7], spliced);
 
@@ -285,8 +345,8 @@
     assertFalse(array.hasOwnProperty(15), "array.hasOwnProperty(15)");
     assertFalse(array.hasOwnProperty(31), "array.hasOwnProperty(31)");
     assertFalse(array.hasOwnProperty(63), "array.hasOwnProperty(63)");
-    assertFalse(array.hasOwnProperty(2 << 32 - 1),
-                "array.hasOwnProperty(2 << 31 - 1)");
+    assertFalse(array.hasOwnProperty(Math.pow(2, 32) - 2),
+                "array.hasOwnProperty(Math.pow(2, 32) - 2)");
   }
 })();
 
@@ -333,8 +393,8 @@
     assertFalse(array.hasOwnProperty(15), "array.hasOwnProperty(15)");
     assertFalse(array.hasOwnProperty(31), "array.hasOwnProperty(31)");
     assertFalse(array.hasOwnProperty(63), "array.hasOwnProperty(63)");
-    assertFalse(array.hasOwnProperty(2 << 32 - 1),
-                "array.hasOwnProperty(2 << 31 - 1)");
+    assertFalse(array.hasOwnProperty(Math.pow(2, 32) - 2),
+                "array.hasOwnProperty(Math.pow(2, 32) - 2)");
   }
 })();
 
@@ -357,7 +417,7 @@
 (function() {
   for (var i = 0; i < 7; i++) {
     try {
-      new Array((1 << 32) - 3).splice(-1, 0, 1, 2, 3, 4, 5);
+      new Array(Math.pow(2, 32) - 3).splice(-1, 0, 1, 2, 3, 4, 5);
       throw 'Should have thrown RangeError';
     } catch (e) {
       assertTrue(e instanceof RangeError);

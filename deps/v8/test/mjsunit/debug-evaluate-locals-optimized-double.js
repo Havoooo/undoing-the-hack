@@ -25,7 +25,9 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-// Flags: --expose-debug-as debug --expose-gc --allow-natives-syntax --inline-construct
+// Flags: --expose-debug-as debug --expose-gc --allow-natives-syntax
+// Flags: --inline-construct
+
 // Get the Debug object exposed from the debug context global object.
 Debug = debug.Debug
 
@@ -43,13 +45,17 @@ var input = [
 ];
 
 var expected = [
-  { locals: {a0: 1.01, b0: 2.02}, args: { names: ["i", "x0", "y0"], values: [0, 3.03, 4.04] } },
-  { locals: {a1: 3.03, b1: 4.04}, args: { names: ["i", "x1", "y1"], values: [1, 5.05, 6.06] } },
-  { locals: {a2: 5.05, b2: 6.06}, args: { names: ["i"], values: [2] } },
-  { locals: {a3: 7.07, b3: 8.08}, args: { names: ["i", "x3", "y3", "z3"],
-                                          values: [3, 9.09, 10.10, undefined] }
-  },
-  { locals: {a4: 9.09, b4: 10.10}, args: { names: ["i", "x4", "y4"], values: [4, 11.11, 12.12] } }
+  { locals: {a0: 1.01, b0: 2.02},
+    args: { names: ["i", "x0", "y0"], values: [0, 3.03, 4.04] } },
+  { locals: {a1: 3.03, b1: 4.04},
+    args: { names: ["i", "x1", "y1"], values: [1, 5.05, 6.06] } },
+  { locals: {a2: 5.05, b2: 6.06},
+    args: { names: ["i"], values: [2] } },
+  { locals: {a3: 7.07, b3: 8.08},
+    args: { names: ["i", "x3", "y3", "z3"],
+            values: [3, 9.09, 10.10, undefined] } },
+  { locals: {a4: 9.09, b4: 10.10},
+    args: { names: ["i", "x4", "y4"], values: [4, 11.11, 12.12] } }
 ];
 
 function arraySum(arr) {
@@ -78,22 +84,26 @@ function listener(event, exec_state, event_data, data) {
           // All frames except the bottom one have expected arguments.
           for (var j = 0; j < expected_args.names.length; j++) {
             assertEquals(expected_args.names[j], frame.argumentName(j));
-            assertEquals(expected_args.values[j], frame.argumentValue(j).value());
+            assertEquals(expected_args.values[j],
+                         frame.argumentValue(j).value());
           }
 
           // All frames except the bottom one have two scopes.
-          assertEquals(2, frame.scopeCount());
+          assertEquals(3, frame.scopeCount());
           assertEquals(debug.ScopeType.Local, frame.scope(0).scopeType());
-          assertEquals(debug.ScopeType.Global, frame.scope(1).scopeType());
+          assertEquals(debug.ScopeType.Script, frame.scope(1).scopeType());
+          assertEquals(debug.ScopeType.Global, frame.scope(2).scopeType());
 
           Object.keys(expected_locals).forEach(function (name) {
-            assertEquals(expected_locals[name], frame.scope(0).scopeObject().value()[name]);
+            assertEquals(expected_locals[name],
+                         frame.scope(0).scopeObject().value()[name]);
           });
 
           for (var j = 0; j < expected_args.names.length; j++) {
             var arg_name = expected_args.names[j];
             var arg_value = expected_args.values[j];
-            assertEquals(arg_value, frame.scope(0).scopeObject().value()[arg_name]);
+            assertEquals(arg_value,
+                         frame.scope(0).scopeObject().value()[arg_name]);
           }
 
           // Evaluate in the inlined frame.
@@ -114,7 +124,8 @@ function listener(event, exec_state, event_data, data) {
                        map(function (k) { return expected_locals[k]; }));
 
           assertEquals(expected_locals_sum + expected_args_sum,
-                       frame.evaluate(Object.keys(expected_locals).join('+') + ' + ' +
+                       frame.evaluate(Object.keys(expected_locals).join('+') +
+                                      ' + ' +
                                       expected_args.names.join('+')).value());
 
           var arguments_sum = expected_args.names.map(function(_, idx) {
@@ -124,8 +135,9 @@ function listener(event, exec_state, event_data, data) {
                        frame.evaluate(arguments_sum).value());
         } else {
           // The bottom frame only have the global scope.
-          assertEquals(1, frame.scopeCount());
-          assertEquals(debug.ScopeType.Global, frame.scope(0).scopeType());
+          assertEquals(2, frame.scopeCount());
+          assertEquals(debug.ScopeType.Script, frame.scope(0).scopeType());
+          assertEquals(debug.ScopeType.Global, frame.scope(1).scopeType());
         }
 
         // Check the frame function.
@@ -175,6 +187,7 @@ function h(i, x0, y0) {
   a0 = a0 + a0 / 100;
   b0 = b0 + b0 / 100;
   debugger;  // Breakpoint.
+  return a0 + b0;
 };
 
 function g3(i, x1, y1) {
@@ -183,7 +196,7 @@ function g3(i, x1, y1) {
   a1 = a1 + a1 / 100;
   b1 = b1 + b1 / 100;
   h(i - 1, a1, b1);
-  return a1+b1;
+  return a1 + b1;
 };
 
 function g2(i) {
@@ -192,6 +205,7 @@ function g2(i) {
   a2 = a2 + a2 / 100;
   b2 = b2 + b2 / 100;
   g3(i - 1, a2, b2);
+  return a2 + b2;
 };
 
 function g1(i, x3, y3, z3) {
@@ -200,6 +214,7 @@ function g1(i, x3, y3, z3) {
   a3 = a3 + a3 / 100;
   b3 = b3 + b3 / 100;
   new g2(i - 1, a3, b3);
+  return a3 + b3;
 };
 
 function f(i, x4, y4) {
@@ -208,6 +223,7 @@ function f(i, x4, y4) {
   a4 = a4 + a4 / 100;
   b4 = b4 + b4 / 100;
   g1(i - 1, a4, b4);
+  return a4 + b4;
 };
 
 // Test calling f normally and as a constructor.

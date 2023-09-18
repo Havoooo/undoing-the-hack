@@ -26,117 +26,198 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
-import test
-import os
-from os.path import join, exists
-import urllib
 import hashlib
+import imp
+import os
+import shutil
 import sys
 import tarfile
 
 
-TEST_262_ARCHIVE_REVISION = 'fb327c439e20'  # This is the r334 revision.
-TEST_262_ARCHIVE_MD5 = '307acd166ec34629592f240dc12d57ed'
-TEST_262_URL = 'http://hg.ecmascript.org/tests/test262/archive/%s.tar.bz2'
-TEST_262_HARNESS = ['sta.js']
+from testrunner.local import statusfile
+from testrunner.local import testsuite
+from testrunner.local import utils
+from testrunner.objects import testcase
+
+DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+ARCHIVE = DATA + ".tar"
+
+TEST_262_HARNESS_FILES = ["sta.js", "assert.js"]
+
+TEST_262_SUITE_PATH = ["data", "test"]
+TEST_262_HARNESS_PATH = ["data", "harness"]
+TEST_262_TOOLS_PATH = ["data", "tools", "packaging"]
+
+ALL_VARIANT_FLAGS_STRICT = dict(
+    (v, [flags + ["--use-strict"] for flags in flag_sets])
+    for v, flag_sets in testsuite.ALL_VARIANT_FLAGS.iteritems()
+)
+
+FAST_VARIANT_FLAGS_STRICT = dict(
+    (v, [flags + ["--use-strict"] for flags in flag_sets])
+    for v, flag_sets in testsuite.FAST_VARIANT_FLAGS.iteritems()
+)
+
+ALL_VARIANT_FLAGS_BOTH = dict(
+    (v, [flags for flags in testsuite.ALL_VARIANT_FLAGS[v] +
+                            ALL_VARIANT_FLAGS_STRICT[v]])
+    for v in testsuite.ALL_VARIANT_FLAGS
+)
+
+FAST_VARIANT_FLAGS_BOTH = dict(
+    (v, [flags for flags in testsuite.FAST_VARIANT_FLAGS[v] +
+                            FAST_VARIANT_FLAGS_STRICT[v]])
+    for v in testsuite.FAST_VARIANT_FLAGS
+)
+
+ALL_VARIANTS = {
+  'nostrict': testsuite.ALL_VARIANT_FLAGS,
+  'strict': ALL_VARIANT_FLAGS_STRICT,
+  'both': ALL_VARIANT_FLAGS_BOTH,
+}
+
+FAST_VARIANTS = {
+  'nostrict': testsuite.FAST_VARIANT_FLAGS,
+  'strict': FAST_VARIANT_FLAGS_STRICT,
+  'both': FAST_VARIANT_FLAGS_BOTH,
+}
+
+class Test262VariantGenerator(testsuite.VariantGenerator):
+  def GetFlagSets(self, testcase, variant):
+    if testcase.outcomes and statusfile.OnlyFastVariants(testcase.outcomes):
+      variant_flags = FAST_VARIANTS
+    else:
+      variant_flags = ALL_VARIANTS
+
+    test_record = self.suite.GetTestRecord(testcase)
+    if "noStrict" in test_record:
+      return variant_flags["nostrict"][variant]
+    if "onlyStrict" in test_record:
+      return variant_flags["strict"][variant]
+    return variant_flags["both"][variant]
 
 
-class Test262TestCase(test.TestCase):
+class Test262TestSuite(testsuite.TestSuite):
 
-  def __init__(self, filename, path, context, root, mode, framework):
-    super(Test262TestCase, self).__init__(context, path, mode)
-    self.filename = filename
-    self.framework = framework
-    self.root = root
+  def __init__(self, name, root):
+    super(Test262TestSuite, self).__init__(name, root)
+    self.testroot = os.path.join(self.root, *TEST_262_SUITE_PATH)
+    self.harnesspath = os.path.join(self.root, *TEST_262_HARNESS_PATH)
+    self.harness = [os.path.join(self.harnesspath, f)
+                    for f in TEST_262_HARNESS_FILES]
+    self.harness += [os.path.join(self.root, "harness-adapt.js")]
+    self.ParseTestRecord = None
 
-  def IsNegative(self):
-    return '@negative' in self.GetSource()
-
-  def GetLabel(self):
-    return "%s test262 %s" % (self.mode, self.GetName())
-
-  def IsFailureOutput(self, output):
-    if output.exit_code != 0:
-      return True
-    return 'FAILED!' in output.stdout
-
-  def GetCommand(self):
-    result = self.context.GetVmCommand(self, self.mode)
-    result += [ '--es5_readonly' ]  # Temporary hack until we can remove flag
-    result += self.framework
-    result.append(self.filename)
-    return result
-
-  def GetName(self):
-    return self.path[-1]
-
-  def GetSource(self):
-    return open(self.filename).read()
-
-
-class Test262TestConfiguration(test.TestConfiguration):
-
-  def __init__(self, context, root):
-    super(Test262TestConfiguration, self).__init__(context, root)
-
-  def ListTests(self, current_path, path, mode, variant_flags):
-    testroot = join(self.root, 'data', 'test', 'suite')
-    harness = [join(self.root, 'data', 'test', 'harness', f)
-                   for f in TEST_262_HARNESS]
-    harness += [join(self.root, 'harness-adapt.js')]
+  def ListTests(self, context):
     tests = []
-    for root, dirs, files in os.walk(testroot):
-      for dotted in [x for x in dirs if x.startswith('.')]:
+    for dirname, dirs, files in os.walk(self.testroot):
+      for dotted in [x for x in dirs if x.startswith(".")]:
         dirs.remove(dotted)
+      if context.noi18n and "intl402" in dirs:
+        dirs.remove("intl402")
       dirs.sort()
-      root_path = root[len(self.root):].split(os.path.sep)
-      root_path = current_path + [x for x in root_path if x]
       files.sort()
-      for file in files:
-        if file.endswith('.js'):
-          test_path = ['test262', file[:-3]]
-          if self.Contains(path, test_path):
-            test = Test262TestCase(join(root, file), test_path, self.context,
-                                   self.root, mode, harness)
-            tests.append(test)
+      for filename in files:
+        if filename.endswith(".js"):
+          fullpath = os.path.join(dirname, filename)
+          relpath = fullpath[len(self.testroot) + 1 : -3]
+          testname = relpath.replace(os.path.sep, "/")
+          case = testcase.TestCase(self, testname)
+          tests.append(case)
     return tests
 
+  def GetFlagsForTestCase(self, testcase, context):
+    return (testcase.flags + context.mode_flags + self.harness +
+            self.GetIncludesForTest(testcase) + ["--harmony"] +
+            [os.path.join(self.testroot, testcase.path + ".js")] +
+            (["--throws"] if "negative" in self.GetTestRecord(testcase) else []))
+
+  def _VariantGeneratorFactory(self):
+    return Test262VariantGenerator
+
+  def LoadParseTestRecord(self):
+    if not self.ParseTestRecord:
+      root = os.path.join(self.root, *TEST_262_TOOLS_PATH)
+      f = None
+      try:
+        (f, pathname, description) = imp.find_module("parseTestRecord", [root])
+        module = imp.load_module("parseTestRecord", f, pathname, description)
+        self.ParseTestRecord = module.parseTestRecord
+      except:
+        raise ImportError("Cannot load parseTestRecord; you may need to "
+                          "gclient sync for test262")
+      finally:
+        if f:
+          f.close()
+    return self.ParseTestRecord
+
+  def GetTestRecord(self, testcase):
+    if not hasattr(testcase, "test_record"):
+      ParseTestRecord = self.LoadParseTestRecord()
+      testcase.test_record = ParseTestRecord(self.GetSourceForTest(testcase),
+                                             testcase.path)
+    return testcase.test_record
+
+  def GetIncludesForTest(self, testcase):
+    test_record = self.GetTestRecord(testcase)
+    if "includes" in test_record:
+      includes = [os.path.join(self.harnesspath, f)
+                  for f in test_record["includes"]]
+    else:
+      includes = []
+    return includes
+
+  def GetSourceForTest(self, testcase):
+    filename = os.path.join(self.testroot, testcase.path + ".js")
+    with open(filename) as f:
+      return f.read()
+
+  def _ParseException(self, str):
+    for line in str.split("\n")[::-1]:
+      if line and not line[0].isspace() and ":" in line:
+        return line.split(":")[0]
+
+
+  def IsFailureOutput(self, testcase):
+    output = testcase.output
+    test_record = self.GetTestRecord(testcase)
+    if output.exit_code != 0:
+      return True
+    if "negative" in test_record:
+      if self._ParseException(output.stdout) != test_record["negative"]:
+        return True
+    return "FAILED!" in output.stdout
+
+  def HasUnexpectedOutput(self, testcase):
+    outcome = self.GetOutcome(testcase)
+    if (statusfile.FAIL_SLOPPY in testcase.outcomes and
+        "--use-strict" not in testcase.flags):
+      return outcome != statusfile.FAIL
+    return not outcome in (testcase.outcomes or [statusfile.PASS])
+
   def DownloadData(self):
-    revision = TEST_262_ARCHIVE_REVISION
-    archive_url = TEST_262_URL % revision
-    archive_name = join(self.root, 'test262-%s.tar.bz2' % revision)
-    directory_name = join(self.root, 'data')
-    directory_old_name = join(self.root, 'data.old')
-    if not exists(archive_name):
-      print "Downloading test data from %s ..." % archive_url
-      urllib.urlretrieve(archive_url, archive_name)
-      if exists(directory_name):
-        os.rename(directory_name, directory_old_name)
-    if not exists(directory_name):
-      print "Extracting test262-%s.tar.bz2 ..." % revision
-      md5 = hashlib.md5()
-      with open(archive_name,'rb') as f:
-        for chunk in iter(lambda: f.read(8192), ''):
-          md5.update(chunk)
-      if md5.hexdigest() != TEST_262_ARCHIVE_MD5:
-        os.remove(archive_name)
-        raise Exception("Hash mismatch of test data file")
-      archive = tarfile.open(archive_name, 'r:bz2')
-      if sys.platform in ('win32', 'cygwin'):
-        # Magic incantation to allow longer path names on Windows.
-        archive.extractall(u'\\\\?\\%s' % self.root)
-      else:
-        archive.extractall(self.root)
-      os.rename(join(self.root, 'test262-%s' % revision), directory_name)
+    print "Test262 download is deprecated. It's part of DEPS."
 
-  def GetBuildRequirements(self):
-    return ['d8']
+    # Clean up old directories and archive files.
+    directory_old_name = os.path.join(self.root, "data.old")
+    if os.path.exists(directory_old_name):
+      shutil.rmtree(directory_old_name)
 
-  def GetTestStatus(self, sections, defs):
-    status_file = join(self.root, 'test262.status')
-    if exists(status_file):
-      test.ReadConfigurationInto(status_file, sections, defs)
+    archive_files = [f for f in os.listdir(self.root)
+                     if f.startswith("tc39-test262-")]
+    if len(archive_files) > 0:
+      print "Clobber outdated test archives ..."
+      for f in archive_files:
+        os.remove(os.path.join(self.root, f))
+
+    # The archive is created only on swarming. Local checkouts have the
+    # data folder.
+    if os.path.exists(ARCHIVE) and not os.path.exists(DATA):
+      print "Extracting archive..."
+      tar = tarfile.open(ARCHIVE)
+      tar.extractall(path=os.path.dirname(ARCHIVE))
+      tar.close()
 
 
-def GetConfiguration(context, root):
-  return Test262TestConfiguration(context, root)
+def GetSuite(name, root):
+  return Test262TestSuite(name, root)

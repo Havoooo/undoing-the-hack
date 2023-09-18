@@ -163,6 +163,30 @@ replaceTest("0a1b2cx", short, /(x)(?=(.))/g, function r(m, c1, c2, i, s) {
 assertEquals(3, ctr, "replace(/x/g,func) num-match");
 
 
+replaceTest("ABCD", "abcd", /(.)/g, function r(m, c1, i, s) {
+  assertEquals("d", RegExp.lastMatch);
+  assertEquals("d", RegExp.$1);
+  assertEquals("abc", RegExp.leftContext);
+  return m.toUpperCase();
+});
+
+
+var long = "";
+while (long.length < 0x2000) {
+  long += String.fromCharCode(65 + Math.random() * 26);
+}
+
+for (var i = 0; i < 3; i++) {
+  replaceTest(long.toLowerCase(), long, /(..)/g, function r(m, c1, i, s) {
+    var expected = long.substring(0x1ffe, 0x2000);
+    assertEquals(expected, RegExp.lastMatch);
+    assertEquals(expected, RegExp.$1);
+    assertEquals(long.substring(0, 0x1ffe), RegExp.leftContext);
+    return m.toLowerCase();
+  });
+}
+
+
 // Test special cases of replacement parts longer than 1<<11.
 var longstring = "xyzzy";
 longstring = longstring + longstring;
@@ -194,21 +218,68 @@ replaceTest("aundefinedbundefinedcundefined",
 
 // Test nested calls to replace, including that it sets RegExp.$& correctly.
 
-function replacer(m,i,s) {
-  assertEquals(m,RegExp['$&']);
-  return "[" + RegExp['$&'] + "-"
-             + m.replace(/./g,"$&$&") + "-"
-             + m.replace(/./g,function() { return RegExp['$&']; })
-             + "-" + RegExp['$&'] + "]";
-}
-
-replaceTest("[ab-aabb-ab-b][az-aazz-az-z]",
-            "abaz", /a./g, replacer);
-
-replaceTest("[ab-aabb-ab-b][az-aazz-az-z]",
-            "abaz", /a(.)/g, replacer);
-
 var str = 'She sells seashells by the seashore.';
 var re = /sh/g;
 assertEquals('She sells sea$schells by the sea$schore.',
              str.replace(re,"$$" + 'sch'))
+
+
+var replace_obj = { length: 0, toString: function() { return "x"; }};
+assertEquals("axc", "abc".replace(/b/, replace_obj));
+assertEquals("axc", "abc".replace(/b/g, replace_obj));
+
+var search_obj = { length: 1, toString: function() { return "b"; }};
+assertEquals("axc", "abc".replace(search_obj, function() { return "x"; }));
+
+var side_effect_flag = false;
+var replace_obj_side_effects = {
+    toString: function() { side_effect_flag = true; return "x" }
+}
+assertEquals("abc", "abc".replace(/z/g, replace_obj_side_effects));
+assertTrue(side_effect_flag);  // Side effect triggers even without a match.
+
+var regexp99pattern = "";
+var subject = "";
+for (var i = 0; i < 99; i++) {
+  regexp99pattern += "(.)";
+  subject += String.fromCharCode(i + 24);
+}
+
+function testIndices99(re) {
+  // Test $1 .. $99
+  for (var i = 1; i < 100; i++) {
+    assertEquals(String.fromCharCode(i + 23),
+                 subject.replace(re, "$" + i));
+  }
+
+  // Test $01 .. $09
+  for (var i = 1; i < 10; i++) {
+    assertEquals(String.fromCharCode(i + 23),
+                 subject.replace(re, "$0" + i));
+  }
+
+  assertEquals("$0", subject.replace(re, "$0"));
+  assertEquals("$00", subject.replace(re, "$00"));
+  assertEquals(String.fromCharCode(10 + 23) + "0",
+               subject.replace(re, "$100"));
+}
+
+testIndices99(new RegExp(regexp99pattern));
+testIndices99(new RegExp(regexp99pattern, "g"));
+
+var regexp59pattern = "";
+for (var i = 0; i < 59; i++) regexp59pattern += "(.)";
+
+function testIndices59(re) {
+  // Test $60 .. $99.  Captures reach up to 59.  Per spec, how to deal
+  // with this is implementation-dependent. We interpret $60 as $6
+  // followed by "0", $61 as $6, followed by "1" and so on.
+  var tail = subject.substr(59);
+  for (var i = 60; i < 100; i++) {
+    assertEquals(String.fromCharCode(i / 10 + 23) + (i % 10) + tail,
+                 subject.replace(re, "$" + i));
+  }
+}
+
+testIndices59(new RegExp(regexp59pattern));
+testIndices59(new RegExp(regexp59pattern, "g"));

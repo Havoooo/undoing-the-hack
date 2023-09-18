@@ -38,11 +38,11 @@ var state = 0;
 function listener(event, exec_state, event_data, data) {
   try {
     if (event == Debug.DebugEvent.Break) {
-      if (state == 0) {
+      if (state < 2) {
         // Step into f2.call:
-        exec_state.prepareStep(Debug.StepAction.StepIn, 2);
-        state = 2;
-      } else if (state == 2) {
+        exec_state.prepareStep(Debug.StepAction.StepIn);
+        state++;
+      } else {
         assertEquals('g', event_data.func().name());
         assertEquals('  return t + 1; // expected line',
                      event_data.sourceLineText());
@@ -142,8 +142,19 @@ function bind1() {
   bound();
 }
 
+// Test step into apply of bound function.
+function applyAndBind1() {
+  var bound = g.bind(null, 3);
+  debugger;
+  bound.apply(null, [3]);
+  var aLocalVar = 'test';
+  var anotherLocalVar  = g(aLocalVar) + 's';
+  var yetAnotherLocal = 10;
+}
+
 var testFunctions =
-    [call1, call2, call3, call4, apply1, apply2, apply3, apply4, bind1];
+    [call1, call2, call3, call4, apply1, apply2, apply3, apply4, bind1,
+    applyAndBind1];
 
 for (var i = 0; i < testFunctions.length; i++) {
   state = 0;
